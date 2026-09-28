@@ -1,0 +1,11 @@
+[package]
+name = "pax-ai"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pax_ai"
+path = "src/lib.rs"
+
+[dependencies]
+pax-core = { git = "https://github.com/pax-project/pax-core.git", tag = "1.1.0", version = "1.1.0", default-features = false }
