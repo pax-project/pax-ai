@@ -10,6 +10,8 @@ It's a client of `pax-core`, the same way [`lazy-pax`](https://github.com/pax-pr
 
 Early bootstrap — repo scaffold only, no functionality yet. See [`CLAUDE.md`](CLAUDE.md) for the planned architecture and the [org's `pax-ai` docs](https://github.com/pax-project/.github/blob/main/docs/README.md#architecture-pax-ai) for the full design rationale.
 
+Idea backlog lives in [Discussions → Ideas](https://github.com/pax-project/pax-ai/discussions/categories/ideas) (not Issues — see the org docs above for why), not in a `research.md`/`ideas.md` file.
+
 ## Development
 
 Nix devshell (`direnv allow`, or `nix develop` — same flake `pax-core`/`lazy-pax` use):
