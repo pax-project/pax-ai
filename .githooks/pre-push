@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Facade: the full quality gate, same as CI. All logic lives behind
+# `just` (see justfile) so this hook, `pre-commit`, and CI stay in sync.
+exec nix develop --command just pre-push

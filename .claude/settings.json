@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nix develop --command bash -c 'jq -r \".tool_input.file_path // empty\" | { read -r f; case \"$f\" in *.rs) just fix ;; esac; }' >/dev/null 2>&1 || true",
+            "timeout": 60,
+            "statusMessage": "Auto-fixing Rust files (just fix)..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nix develop --command bash -c 'out=$(just pre-commit 2>&1); code=$?; if [ \"$code\" -ne 0 ]; then echo \"$out\" >&2; exit 2; fi'",
+            "timeout": 60,
+            "statusMessage": "Running quality gate (just pre-commit)..."
+          }
+        ]
+      }
+    ]
+  }
+}

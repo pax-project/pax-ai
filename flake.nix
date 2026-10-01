@@ -79,9 +79,22 @@
             rustfmt
             clippy
             rust-analyzer
+            # Quality-gate tooling (see justfile): `just` unifies the calling
+            # interface across local dev, git hooks, and CI; `cargo-audit`
+            # backs the `audit` check; `jq` parses hook-event JSON for the
+            # Claude Code hooks in .claude/settings.json.
+            just
+            cargo-audit
+            jq
           ]
           ++ app_deps;
         env.RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+        # Wire the repo's git hooks (see .githooks/) in automatically on
+        # shell activation, so the quality gate runs the same way whether
+        # it's triggered locally, by a hook, or by CI.
+        shellHook = ''
+          git config core.hooksPath .githooks
+        '';
       };
 
       env = {
