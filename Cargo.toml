@@ -10,3 +10,11 @@ path = "src/lib.rs"
 
 [dependencies]
 pax-core = { git = "https://github.com/pax-project/pax-core.git", tag = "1.1.0", version = "1.1.0", default-features = false }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
