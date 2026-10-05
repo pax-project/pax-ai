@@ -7,14 +7,4 @@ on:
 
 jobs:
   quality-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      # Facade: every check's own logic lives behind `just ci` (see
-      # justfile), so this workflow has nothing to duplicate or drift
-      # from what runs locally and in the git hooks.
-      - run: nix develop --command just ci
+    uses: pax-project/.github/.github/workflows/rust-ci.yml@main
