@@ -40,4 +40,4 @@ cargo clippy  # lint
 
 ## Dependency on `pax-core`
 
-Git dependency pinned to a release tag, `default-features = false` (the `cli` feature — and its `clap`/`dotenvy`/`tokio` deps — stays off), same as `lazy-pax`. Bumping the pin to a later `pax-core` release is a deliberate, explicit step, not automatic.
+crates.io dependency on the published `pax-core-papers` package, aliased back to `pax-core` (its lib name is still `pax_core`), `default-features = false` (the `cli` feature — and its `clap`/`dotenvy`/`tokio` deps — stays off), same as `lazy-pax`. Moving to a later `pax-core` release is a deliberate, explicit step, not automatic.
