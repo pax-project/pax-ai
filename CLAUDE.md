@@ -13,7 +13,7 @@ Full architecture rationale (why this is a separate crate instead of a `pax-core
 - Writes only ever go through `pax-core` functions — never hand-write `papers.nix`.
 - Any persisted state (embeddings, cached summaries) is a rebuildable cache derived purely from `papers.nix` via `pax-core`'s read functions — never a second source of truth.
 - Any LLM/API call runs off the UI/event thread (the same `spawn_blocking` pattern `pax-core`/`lazy-pax` use for provider search and `nix` calls) — callers must never block on a network round-trip.
-- Ideas that don't need an LLM/embedding step aren't `pax-ai`'s concern — they belong in `pax-core` or `lazy-pax` directly.
+- Ideas that don't need an LLM/embedding step aren't `pax-ai`'s concern — they belong in `pax-core` or `lazy-pax` directly. The one exception is the MCP server (`src/mcp.rs`, binary `pax-mcp`, behind the default `mcp` feature): the org docs place it here so AI clients have one integration point, but its tools only wrap `pax-core` calls — domain logic still goes in `pax-core`.
 
 ## Planned architecture: ports and adapters for the LLM capability
 
@@ -32,7 +32,8 @@ Nix + direnv for the dev shell (`flake.nix`, `.envrc`), same pattern as `pax-cor
 ## Commands
 
 ```bash
-cargo build   # builds the pax-ai library
+cargo build   # builds the pax-ai library + the pax-mcp binary (mcp is a default feature)
+cargo build --no-default-features  # library alone, without the MCP SDK/tokio
 cargo test    # unit tests
 cargo fmt     # format
 cargo clippy  # lint

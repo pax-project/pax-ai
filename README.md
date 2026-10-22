@@ -8,7 +8,18 @@ It's a client of `pax-core`, the same way [`lazy-pax`](https://github.com/pax-pr
 
 ## Status
 
-Early bootstrap — repo scaffold only, no functionality yet. See [`CLAUDE.md`](CLAUDE.md) for the planned architecture and the [org's `pax-ai` docs](https://github.com/pax-project/.github/blob/main/docs/README.md#architecture-pax-ai) for the full design rationale.
+Early: the LLM port with Anthropic and Ollama adapters, cached summaries, and a first MCP server (below). See [`CLAUDE.md`](CLAUDE.md) for the planned architecture and the [org's `pax-ai` docs](https://github.com/pax-project/.github/blob/main/docs/README.md#architecture-pax-ai) for the full design rationale.
+
+## MCP server
+
+`pax-mcp [ROOT]` serves the research library under `ROOT` (default: the current directory) over MCP on stdin/stdout. Tools so far: `search`, `show`, `add`, `list`. Results are JSON, and every write goes through `pax-core`, so the library stays usable from the `pax` CLI and lazy-pax.
+
+```Bash
+cargo build --release --bin pax-mcp
+claude mcp add pax -- /path/to/pax-mcp /path/to/library
+```
+
+`SEMANTIC_SCHOLAR_API_KEY` and `ARXIV_CONTACT` are read from the environment, as for `pax`. Library consumers that don't need the server can depend on `pax-ai` with `default-features = false` to leave out the `mcp` feature and its dependencies.
 
 Idea backlog lives in [Discussions → Ideas](https://github.com/pax-project/pax-ai/discussions/categories/ideas) (not Issues — see the org docs above for why), not in a `research.md`/`ideas.md` file.
 
