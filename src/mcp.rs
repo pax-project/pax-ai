@@ -4,15 +4,20 @@
 //!
 //! None of these tools need an LLM: they wrap `pax-core` calls, and every
 //! write goes through `pax-core`, so an agent's decisions land in the same
-//! `research/` files the `pax` CLI and lazy-pax use. Results are this
+//! `research/` files the `pax` CLI and lazy-pax use — searches included,
+//! which are recorded in `research/search-log.jsonl`. Results are this
 //! module's own serializable types, since `pax-core`'s don't derive
 //! `Serialize`.
 
+use std::collections::HashMap;
+use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
 
+use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
-    CandidateId, CandidateWork, Config, LibraryIndex, ListFilter, Paper, ProviderId, ShowResult,
+    CandidateId, CandidateWork, Config, DocType, Filters, LibraryIndex, Limit, ListFilter,
+    LogOutcome, Logged, Paper, ProviderId, SearchOptions, SearchPage, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,20 +26,67 @@ use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Providers in the order results are reported, matching the `pax` CLI.
-const PROVIDERS: [ProviderId; 4] = [
-    ProviderId::OpenAlex,
-    ProviderId::Crossref,
-    ProviderId::SemanticScholar,
-    ProviderId::ArXiv,
-];
+/// How many results to retrieve per provider, and the filters to apply —
+/// the `pax` CLI's `--limit`/`--all`/`--year`/`--type`/`--lang`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct PagingParams {
+    /// Retrieve at most this many results per provider (default 50).
+    pub limit: Option<usize>,
+    /// Retrieve every result each provider serves instead of `limit` (can be
+    /// slow).
+    #[serde(default)]
+    pub all: bool,
+    /// Publication year: `2020`, or an inclusive range `2015-2020`, `2015-`
+    /// (from 2015 on) or `-2020` (up to 2020).
+    pub year: Option<String>,
+    /// Document type: journal-article, conference-paper, preprint, review,
+    /// book, book-chapter, thesis, or dataset.
+    #[serde(rename = "type")]
+    pub doc_type: Option<String>,
+    /// Language, as an ISO 639-1 code (e.g. `en`).
+    pub language: Option<String>,
+}
 
-#[derive(Debug, Deserialize, JsonSchema)]
+impl PagingParams {
+    /// The `pax-core` search options these parameters ask for; parsing is
+    /// `pax-core`'s, so the accepted values match the CLI's.
+    fn options(&self) -> Result<SearchOptions, String> {
+        let defaults = SearchOptions::default();
+        let limit = match (self.all, self.limit) {
+            (true, Some(_)) => return Err("give `limit` or `all`, not both".to_string()),
+            (true, None) => Limit::All,
+            (false, Some(0)) => return Err("`limit` must be at least 1".to_string()),
+            (false, Some(n)) => Limit::Count(n),
+            (false, None) => defaults.limit,
+        };
+        let mut filters = Filters::default();
+        if let Some(year) = &self.year {
+            let years: YearRange = year.trim().parse().map_err(|e| format!("{e}"))?;
+            filters = filters.with_years(years);
+        }
+        if let Some(doc_type) = &self.doc_type {
+            let doc_type: DocType = doc_type.trim().parse().map_err(|e| format!("{e}"))?;
+            filters = filters.with_doc_type(doc_type);
+        }
+        if let Some(language) = &self.language {
+            let language = language.trim();
+            if language.is_empty() {
+                return Err("`language` must be an ISO 639-1 code, e.g. `en`".to_string());
+            }
+            filters = filters.with_language(language);
+        }
+        Ok(defaults.with_limit(limit).with_filters(filters))
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// Free-text query. Give exactly one of `query` or `author`.
     pub query: Option<String>,
     /// Author name, for an author-scoped search instead of free text.
     pub author: Option<String>,
+    #[serde(flatten)]
+    pub paging: PagingParams,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -54,9 +106,9 @@ pub struct ListParams {
     pub tag: Option<String>,
 }
 
-/// A search hit from one provider, not yet declared in the library.
+/// One provider's record of a paper.
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct Hit {
+pub struct Candidate {
     /// The reference `show` and `add` accept, e.g. `openalex:W2072794470`.
     pub id: String,
     pub title: String,
@@ -65,21 +117,98 @@ pub struct Hit {
     pub doi: Option<String>,
     pub venue: Option<String>,
     pub pdf_available: bool,
-    /// Whether a paper with this DOI is already declared in the library.
+    /// Whether the paper is already declared in the library (matched by DOI
+    /// or arXiv id, so any provider's record of it counts).
     pub in_library: bool,
+    /// Whether the paper is excluded in `research/excluded.nix`.
+    pub excluded: bool,
 }
 
+/// One paper in a result list, merged across every provider that returned
+/// it. The flattened fields are its representative record (the published
+/// version, if any); `in_library` and `excluded` hold if any record is.
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct ProviderResults {
+pub struct MergedHit {
+    #[serde(flatten)]
+    pub work: Candidate,
+    /// The providers that returned this paper, without repeats.
+    pub providers: Vec<String>,
+    /// Every merged record's reference, representative (`id`) first; any of
+    /// them works with `show` and `add`.
+    pub ids: Vec<String>,
+    /// Kept by a language filter although no record carries a language to
+    /// check it against.
+    pub language_unknown: bool,
+}
+
+/// How one provider applied one requested filter.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AppliedFilter {
+    /// `year`, `type`, or `language`.
+    pub filter: String,
+    /// `server-side` (the provider's `total` reflects it), `post-retrieval`
+    /// (applied to the records fetched; `total` counts records before it),
+    /// or `not applied` (the provider has no such data, so its results
+    /// ignore the filter).
+    pub applied: String,
+}
+
+/// What one provider returned.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProviderReport {
     pub provider: String,
-    pub hits: Vec<Hit>,
-    /// Set when this provider failed; the other providers' results still stand.
+    /// Records retrieved (0 when the provider failed).
+    pub retrieved: usize,
+    /// Records the provider reports matching in total; null when it doesn't
+    /// report one.
+    pub total: Option<u64>,
+    /// Whether every matching record was retrieved; false when `total` is
+    /// unknown. If not, ask again with a higher `limit` or `all`.
+    pub complete: bool,
+    /// The most this provider serves for one query, however far it's paged.
+    pub max_retrievable: Option<u64>,
+    /// Records fetched before any post-retrieval filter dropped some.
+    pub scanned: u64,
+    pub filters: Vec<AppliedFilter>,
+    /// Retrieved records the language filter kept without a language to
+    /// check.
+    pub language_unknown: usize,
+    /// Set when this provider failed; the other providers' results still
+    /// stand.
     pub error: Option<String>,
 }
 
+/// Record counts before and after merging duplicates across providers.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MergeCounts {
+    /// Records retrieved from every provider.
+    pub before: usize,
+    /// Distinct papers (`results.len()`).
+    pub after: usize,
+    /// Records merged into another (`before - after`).
+    pub duplicates: usize,
+    /// Records with no DOI, arXiv id, or title and year, kept as their own
+    /// rows since they can't be matched.
+    pub unmatched: usize,
+}
+
+/// Whether a search was recorded in the library's search log.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SearchLogStatus {
+    pub logged: bool,
+    /// The log file, when logged.
+    pub path: Option<String>,
+    /// Why it wasn't logged.
+    pub reason: Option<String>,
+}
+
+/// Per-provider counts and one list merged across providers.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SearchResults {
-    pub providers: Vec<ProviderResults>,
+    pub providers: Vec<ProviderReport>,
+    pub merge: MergeCounts,
+    pub results: Vec<MergedHit>,
+    pub log: SearchLogStatus,
 }
 
 /// A paper declared in the library.
@@ -102,7 +231,7 @@ pub struct DeclaredPaper {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ShowOutput {
     pub declared: Option<DeclaredPaper>,
-    pub candidate: Option<Hit>,
+    pub candidate: Option<Candidate>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -135,47 +264,34 @@ impl PaxServer {
     }
 
     /// Search every provider (OpenAlex, Crossref, Semantic Scholar, arXiv) for
-    /// papers, by free text or by author. Each hit's `id` is what `show` and
-    /// `add` accept.
+    /// papers, by free text or by author, optionally filtered by year, type,
+    /// and language. Reports each provider's retrieved/total counts, then one
+    /// list merged across providers, each paper flagged if it's already in
+    /// the library or excluded. Any result `id` works with `show` and `add`.
+    /// The search is recorded in the library's search log.
     #[tool]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResults>, String> {
-        let config = self.config.clone();
-        let results = match (params.query, params.author) {
+        let options = params.paging.options()?;
+        let (root, config) = (self.root.clone(), self.config.clone());
+        let logged = match (params.query, params.author) {
             (Some(query), None) => {
-                off_thread(move || async move { pax_core::search_all(&query, &config).await })
-                    .await?
+                off_thread(move || async move {
+                    pax_core::search_all_logged(&query, &options, &root, &config).await
+                })
+                .await?
             }
             (None, Some(author)) => {
-                off_thread(
-                    move || async move { pax_core::search_by_author(&author, &config).await },
-                )
+                off_thread(move || async move {
+                    pax_core::search_by_author_logged(&author, &options, &root, &config).await
+                })
                 .await?
             }
             _ => return Err("give exactly one of `query` or `author`".to_string()),
         };
-        let index = LibraryIndex::load(&self.root);
-        let providers = PROVIDERS
-            .iter()
-            .filter_map(|provider| {
-                let result = results.get(provider)?;
-                Some(match result {
-                    Ok(works) => ProviderResults {
-                        provider: provider.to_string(),
-                        hits: works.iter().map(|w| hit(w, &index)).collect(),
-                        error: None,
-                    },
-                    Err(e) => ProviderResults {
-                        provider: provider.to_string(),
-                        hits: Vec::new(),
-                        error: Some(e.to_string()),
-                    },
-                })
-            })
-            .collect();
-        Ok(Json(SearchResults { providers }))
+        Ok(Json(self.results(logged, &PROVIDER_ORDER)))
     }
 
     /// Show one paper: a provider reference from `search` (resolved live), or
@@ -193,10 +309,17 @@ impl PaxServer {
                 declared: Some(declared(&paper)),
                 candidate: None,
             },
-            ShowResult::Candidate(work) => ShowOutput {
-                declared: None,
-                candidate: Some(hit(&work, &LibraryIndex::load(&self.root))),
-            },
+            ShowResult::Candidate(work) => {
+                let index = LibraryIndex::load(&self.root);
+                ShowOutput {
+                    declared: None,
+                    candidate: Some(candidate(
+                        &work,
+                        index.contains(&work),
+                        index.is_excluded(&work),
+                    )),
+                }
+            }
         }))
     }
 
@@ -238,6 +361,20 @@ impl PaxServer {
     }
 }
 
+impl PaxServer {
+    /// A logged search's or citation lookup's results, flagged against the
+    /// library as it is now.
+    fn results<E: Display>(
+        &self,
+        logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
+        providers: &[ProviderId],
+    ) -> SearchResults {
+        let Logged { results, log, .. } = logged;
+        let index = LibraryIndex::load(&self.root);
+        search_results(&results, providers, &index, log)
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PaxServer {
     fn get_info(&self) -> ServerConfig {
@@ -246,7 +383,8 @@ impl ServerHandler for PaxServer {
             .with_instructions(
                 "Tools over a pax research library: search providers for papers, \
                  show one, add it to the library, and list what's declared. \
-                 Writes go to research/papers.nix through pax-core.",
+                 Writes go to research/ through pax-core, and searches are \
+                 recorded in research/search-log.jsonl.",
             )
     }
 }
@@ -268,8 +406,113 @@ where
         .map_err(|e| format!("the request failed to run: {e}"))
 }
 
-fn hit(work: &CandidateWork, index: &LibraryIndex) -> Hit {
-    Hit {
+/// Per-provider reports, in `providers` order, and the successful pages
+/// merged into one list flagged against `index`.
+fn search_results<E: Display>(
+    results: &HashMap<ProviderId, Result<SearchPage, E>>,
+    providers: &[ProviderId],
+    index: &LibraryIndex,
+    log: LogOutcome,
+) -> SearchResults {
+    let reports = providers
+        .iter()
+        .filter_map(|provider| Some(provider_report(*provider, results.get(provider)?)))
+        .collect();
+    let language_unknown = |work: &CandidateWork| {
+        results
+            .values()
+            .flatten()
+            .any(|page| page.is_language_unknown(work))
+    };
+    let merged = pax_core::merge_pages(results);
+    let hits = merged
+        .works
+        .iter()
+        .map(|merged| MergedHit {
+            work: candidate(
+                &merged.work,
+                merged.records().any(|work| index.contains(work)),
+                merged.records().any(|work| index.is_excluded(work)),
+            ),
+            providers: merged.providers().iter().map(ToString::to_string).collect(),
+            ids: merged.ids().iter().map(ToString::to_string).collect(),
+            language_unknown: merged.records().all(language_unknown),
+        })
+        .collect();
+    SearchResults {
+        providers: reports,
+        merge: MergeCounts {
+            before: merged.before,
+            after: merged.after,
+            duplicates: merged.duplicates(),
+            unmatched: merged.unmatched,
+        },
+        results: hits,
+        log: log_status(log),
+    }
+}
+
+fn provider_report<E: Display>(
+    provider: ProviderId,
+    result: &Result<SearchPage, E>,
+) -> ProviderReport {
+    match result {
+        Ok(page) => ProviderReport {
+            provider: provider.to_string(),
+            retrieved: page.retrieved(),
+            total: page.total,
+            complete: page.is_complete(),
+            max_retrievable: page.max_retrievable,
+            scanned: page.scanned,
+            filters: page
+                .filters
+                .iter()
+                .map(|filter| AppliedFilter {
+                    filter: filter.kind.to_string(),
+                    applied: filter.application.to_string(),
+                })
+                .collect(),
+            language_unknown: page.language_unknown.len(),
+            error: None,
+        },
+        Err(e) => ProviderReport {
+            provider: provider.to_string(),
+            retrieved: 0,
+            total: None,
+            complete: false,
+            max_retrievable: None,
+            scanned: 0,
+            filters: Vec::new(),
+            language_unknown: 0,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+fn log_status(log: LogOutcome) -> SearchLogStatus {
+    let not_logged = |reason: String| SearchLogStatus {
+        logged: false,
+        path: None,
+        reason: Some(reason),
+    };
+    match log {
+        LogOutcome::Written(path) => SearchLogStatus {
+            logged: true,
+            path: Some(path.display().to_string()),
+            reason: None,
+        },
+        LogOutcome::NoLibrary => {
+            not_logged("no pax library at the server's root, so nothing was logged".to_string())
+        }
+        LogOutcome::Failed(e) => not_logged(format!(
+            "writing the search log failed: {e}; the results still stand"
+        )),
+        other => not_logged(format!("not logged: {other:?}")),
+    }
+}
+
+fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidate {
+    Candidate {
         id: work.id.to_string(),
         title: work.title.clone(),
         authors: work.authors.clone(),
@@ -277,7 +520,8 @@ fn hit(work: &CandidateWork, index: &LibraryIndex) -> Hit {
         doi: work.doi.clone(),
         venue: work.venue.clone(),
         pdf_available: work.pdf_url.is_some(),
-        in_library: index.contains(work),
+        in_library,
+        excluded,
     }
 }
 
@@ -298,6 +542,7 @@ fn declared(paper: &Paper) -> DeclaredPaper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pax_core::{Exclusion, ExclusionStage, Exclusions, Library, ProviderError};
     use std::fs;
 
     fn library_with_two_papers(name: &str) -> PathBuf {
@@ -334,6 +579,27 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    fn work(
+        provider: ProviderId,
+        native_id: &str,
+        title: &str,
+        doi: Option<&str>,
+    ) -> CandidateWork {
+        CandidateWork {
+            id: CandidateId {
+                provider,
+                native_id: native_id.to_string(),
+            },
+            title: title.to_string(),
+            authors: Vec::new(),
+            publish_date: "2017-06-12".to_string(),
+            doi: doi.map(str::to_string),
+            pdf_url: None,
+            venue: None,
+            abstract_text: None,
+        }
     }
 
     #[test]
@@ -395,17 +661,246 @@ mod tests {
     async fn search_rejects_both_or_neither_mode() {
         let server = PaxServer::new(PathBuf::from("."), Config::default());
         for params in [
-            SearchParams {
-                query: None,
-                author: None,
-            },
+            SearchParams::default(),
             SearchParams {
                 query: Some("actor model".to_string()),
                 author: Some("Hewitt".to_string()),
+                ..SearchParams::default()
             },
         ] {
             assert!(server.search(Parameters(params)).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn search_rejects_invalid_paging_before_searching() {
+        let server = PaxServer::new(PathBuf::from("."), Config::default());
+        let error = server
+            .search(Parameters(SearchParams {
+                query: Some("actor model".to_string()),
+                paging: PagingParams {
+                    year: Some("1970s".to_string()),
+                    ..PagingParams::default()
+                },
+                ..SearchParams::default()
+            }))
+            .await
+            .err()
+            .expect("the search should be refused");
+        assert!(error.contains("1970s"), "{error}");
+    }
+
+    #[test]
+    fn search_params_take_paging_fields_at_the_top_level() {
+        let params: SearchParams = serde_json::from_value(serde_json::json!({
+            "query": "actor model",
+            "limit": 10,
+            "year": "1970-1980",
+            "type": "journal-article",
+            "language": "EN",
+        }))
+        .unwrap();
+        let options = params.paging.options().unwrap();
+        assert_eq!(options.limit, Limit::Count(10));
+        assert_eq!(
+            options.filters.years,
+            YearRange::new(Some(1970), Some(1980))
+        );
+        assert_eq!(options.filters.doc_type, Some(DocType::JournalArticle));
+        assert_eq!(options.filters.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn paging_defaults_to_pax_cores_limit_and_no_filters() {
+        let options = PagingParams::default().options().unwrap();
+        assert_eq!(options, SearchOptions::default());
+
+        let all = PagingParams {
+            all: true,
+            ..PagingParams::default()
+        };
+        assert_eq!(all.options().unwrap().limit, Limit::All);
+    }
+
+    #[test]
+    fn paging_rejects_conflicting_or_invalid_values() {
+        let invalid = [
+            PagingParams {
+                limit: Some(10),
+                all: true,
+                ..PagingParams::default()
+            },
+            PagingParams {
+                limit: Some(0),
+                ..PagingParams::default()
+            },
+            PagingParams {
+                year: Some("2020-2015".to_string()),
+                ..PagingParams::default()
+            },
+            PagingParams {
+                doc_type: Some("blog-post".to_string()),
+                ..PagingParams::default()
+            },
+            PagingParams {
+                language: Some(" ".to_string()),
+                ..PagingParams::default()
+            },
+        ];
+        for params in invalid {
+            assert!(params.options().is_err(), "{params:?}");
+        }
+    }
+
+    #[test]
+    fn search_results_merge_providers_and_flag_library_and_exclusions() {
+        let root = library_with_two_papers("results");
+        let library = Library::load(&pax_core::nix::papers_path(&root)).unwrap();
+        let mut exclusions = Exclusions::default();
+        exclusions.upsert(Exclusion::new(
+            "10.1000/excluded".to_string(),
+            "Excluded".to_string(),
+            "off topic".to_string(),
+            ExclusionStage::Screening,
+        ));
+        let index = LibraryIndex::new(&library, &exclusions);
+
+        let turing = "10.1112/plms/s2-42.1.230";
+        let openalex = SearchPage::new(
+            vec![
+                work(
+                    ProviderId::OpenAlex,
+                    "W1",
+                    "On Computable Numbers",
+                    Some(turing),
+                ),
+                work(
+                    ProviderId::OpenAlex,
+                    "W2",
+                    "Excluded",
+                    Some("10.1000/excluded"),
+                ),
+            ],
+            Some(120),
+            None,
+        );
+        let crossref = SearchPage::new(
+            vec![
+                work(
+                    ProviderId::Crossref,
+                    turing,
+                    "On Computable Numbers",
+                    Some(turing),
+                ),
+                work(
+                    ProviderId::Crossref,
+                    "10.1000/new",
+                    "New",
+                    Some("10.1000/new"),
+                ),
+            ],
+            Some(2),
+            None,
+        );
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> = HashMap::from([
+            (ProviderId::OpenAlex, Ok(openalex)),
+            (ProviderId::Crossref, Ok(crossref)),
+            (
+                ProviderId::ArXiv,
+                Err(ProviderError::Request("timed out".to_string())),
+            ),
+        ]);
+
+        let out = search_results(&results, &PROVIDER_ORDER, &index, LogOutcome::NoLibrary);
+
+        let providers: Vec<_> = out
+            .providers
+            .iter()
+            .map(|p| (p.provider.as_str(), p.retrieved, p.total, p.complete))
+            .collect();
+        assert_eq!(
+            providers,
+            [
+                ("openalex", 2, Some(120), false),
+                ("crossref", 2, Some(2), true),
+                ("arxiv", 0, None, false),
+            ]
+        );
+        assert!(
+            out.providers[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("timed out")
+        );
+
+        assert_eq!(
+            (out.merge.before, out.merge.after, out.merge.duplicates),
+            (4, 3, 1)
+        );
+        let turing_hit = &out.results[0];
+        assert_eq!(turing_hit.work.id, "openalex:W1");
+        assert_eq!(turing_hit.providers, ["openalex", "crossref"]);
+        assert_eq!(
+            turing_hit.ids,
+            ["openalex:W1", &format!("crossref:{turing}")]
+        );
+        assert!(turing_hit.work.in_library && !turing_hit.work.excluded);
+        assert!(out.results[1].work.excluded && !out.results[1].work.in_library);
+        assert!(!out.results[2].work.in_library && !out.results[2].work.excluded);
+
+        assert!(!out.log.logged);
+        assert!(out.log.reason.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_results_report_filters_and_unknown_languages() {
+        use pax_core::{FilterApplication, FilterKind};
+
+        let unknown = work(ProviderId::Crossref, "10.1000/a", "A", Some("10.1000/a"));
+        let page = SearchPage::new(vec![unknown.clone()], Some(40), None)
+            .with_scanned(20)
+            .with_filters(vec![
+                pax_core::AppliedFilter::new(FilterKind::Year, FilterApplication::Server),
+                pax_core::AppliedFilter::new(
+                    FilterKind::Language,
+                    FilterApplication::PostRetrieval,
+                ),
+            ])
+            .with_language_unknown(vec![unknown.id.clone()]);
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> =
+            HashMap::from([(ProviderId::Crossref, Ok(page))]);
+
+        let out = search_results(
+            &results,
+            &PROVIDER_ORDER,
+            &LibraryIndex::default(),
+            LogOutcome::Written(PathBuf::from("research/search-log.jsonl")),
+        );
+
+        let report = &out.providers[0];
+        assert_eq!((report.scanned, report.language_unknown), (20, 1));
+        let filters: Vec<_> = report
+            .filters
+            .iter()
+            .map(|f| (f.filter.as_str(), f.applied.as_str()))
+            .collect();
+        assert_eq!(
+            filters,
+            [("year", "server-side"), ("language", "post-retrieval")]
+        );
+        assert!(out.results[0].language_unknown);
+        assert!(out.log.logged);
+        assert_eq!(out.log.path.as_deref(), Some("research/search-log.jsonl"));
+    }
+
+    #[test]
+    fn a_failed_log_write_is_reported_without_failing_the_results() {
+        let status = log_status(LogOutcome::Failed(std::io::Error::other("disk full")));
+        assert!(!status.logged);
+        assert!(status.reason.unwrap().contains("disk full"));
     }
 
     #[tokio::test]
