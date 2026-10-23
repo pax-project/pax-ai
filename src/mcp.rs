@@ -8,10 +8,12 @@
 //! module's own serializable types, since `pax-core`'s don't derive
 //! `Serialize`.
 
-use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 
-use pax_core::{CandidateId, CandidateWork, Config, ListFilter, Paper, ProviderId, ShowResult};
+use pax_core::{
+    CandidateId, CandidateWork, Config, LibraryIndex, ListFilter, Paper, ProviderId, ShowResult,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -140,12 +142,21 @@ impl PaxServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResults>, String> {
-        let results = match (&params.query, &params.author) {
-            (Some(query), None) => pax_core::search_all(query, &self.config).await,
-            (None, Some(author)) => pax_core::search_by_author(author, &self.config).await,
+        let config = self.config.clone();
+        let results = match (params.query, params.author) {
+            (Some(query), None) => {
+                off_thread(move || async move { pax_core::search_all(&query, &config).await })
+                    .await?
+            }
+            (None, Some(author)) => {
+                off_thread(
+                    move || async move { pax_core::search_by_author(&author, &config).await },
+                )
+                .await?
+            }
             _ => return Err("give exactly one of `query` or `author`".to_string()),
         };
-        let known_dois = pax_core::known_dois(&self.root);
+        let index = LibraryIndex::load(&self.root);
         let providers = PROVIDERS
             .iter()
             .filter_map(|provider| {
@@ -153,7 +164,7 @@ impl PaxServer {
                 Some(match result {
                     Ok(works) => ProviderResults {
                         provider: provider.to_string(),
-                        hits: works.iter().map(|w| hit(w, &known_dois)).collect(),
+                        hits: works.iter().map(|w| hit(w, &index)).collect(),
                         error: None,
                     },
                     Err(e) => ProviderResults {
@@ -184,7 +195,7 @@ impl PaxServer {
             },
             ShowResult::Candidate(work) => ShowOutput {
                 declared: None,
-                candidate: Some(hit(&work, &pax_core::known_dois(&self.root))),
+                candidate: Some(hit(&work, &LibraryIndex::load(&self.root))),
             },
         }))
     }
@@ -240,7 +251,24 @@ impl ServerHandler for PaxServer {
     }
 }
 
-fn hit(work: &CandidateWork, known_dois: &HashSet<String>) -> Hit {
+/// Runs a `pax-core` call on a blocking-pool thread, off the request path.
+/// Needed for paged searches: their futures aren't `Send` (Crossref's
+/// language filter keeps its state in a `RefCell`), so they can't be awaited
+/// in a tool handler directly. The future is built and driven on that one
+/// thread, by the server's runtime.
+async fn off_thread<F, Fut, T>(make: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T>,
+    T: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(make()))
+        .await
+        .map_err(|e| format!("the request failed to run: {e}"))
+}
+
+fn hit(work: &CandidateWork, index: &LibraryIndex) -> Hit {
     Hit {
         id: work.id.to_string(),
         title: work.title.clone(),
@@ -249,10 +277,7 @@ fn hit(work: &CandidateWork, known_dois: &HashSet<String>) -> Hit {
         doi: work.doi.clone(),
         venue: work.venue.clone(),
         pdf_available: work.pdf_url.is_some(),
-        in_library: work
-            .doi
-            .as_deref()
-            .is_some_and(|doi| known_dois.contains(pax_core::normalize_doi(doi))),
+        in_library: index.contains(work),
     }
 }
 

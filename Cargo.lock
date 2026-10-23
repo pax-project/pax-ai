@@ -1154,16 +1154,18 @@ dependencies = [
 [[package]]
 name = "pax-core-papers"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5114d6f5bf8a9af4637c8f893fb2e802509fd0059f68d78e1fd6eefd955bb84"
+source = "git+https://github.com/pax-project/pax-core?rev=8f90564943a823d0d12211ca6d3a1a2e00bd8fa6#8f90564943a823d0d12211ca6d3a1a2e00bd8fa6"
 dependencies = [
  "arxiv-tools",
+ "chrono",
  "crossref-async",
  "papers-openalex",
+ "reqwest 0.12.28",
  "semantic-scholar-rs",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
