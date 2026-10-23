@@ -16,9 +16,9 @@ use std::path::PathBuf;
 
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
-    CandidateId, CandidateWork, Config, DocType, Filters, LibraryIndex, Limit, ListFilter,
-    LogOutcome, Logged, Paper, PaxError, ProviderId, SearchOptions, SearchPage, ShowResult,
-    YearRange,
+    CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Filters, LibraryIndex, Limit,
+    ListFilter, LogOutcome, Logged, Paper, PaxError, ProviderId, SearchOptions, SearchPage,
+    ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -86,6 +86,15 @@ pub struct SearchParams {
     pub query: Option<String>,
     /// Author name, for an author-scoped search instead of free text.
     pub author: Option<String>,
+    #[serde(flatten)]
+    pub paging: PagingParams,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CitationParams {
+    /// The seed paper: a provider reference (e.g. `openalex:W2072794470`, from
+    /// any provider) or the citation key of a paper in the library.
+    pub reference: String,
     #[serde(flatten)]
     pub paging: PagingParams,
 }
@@ -295,6 +304,43 @@ impl PaxServer {
         Ok(Json(self.results(logged, &PROVIDER_ORDER)))
     }
 
+    /// The papers a seed paper cites, from OpenAlex and Semantic Scholar (the
+    /// providers with real citation data), in the same shape as `search`:
+    /// per-provider counts, then one merged list flagged against the
+    /// library. Recorded in the library's search log.
+    #[tool]
+    async fn refs(
+        &self,
+        Parameters(params): Parameters<CitationParams>,
+    ) -> Result<Json<SearchResults>, String> {
+        let options = params.paging.options()?;
+        let seed = params.reference;
+        let (root, config) = (self.root.clone(), self.config.clone());
+        let logged = off_thread(move || async move {
+            pax_core::references_logged(&seed, &options, &root, &config).await
+        })
+        .await?
+        .map_err(|e| e.to_string())?;
+        Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
+    }
+
+    /// The papers citing a seed paper; otherwise as `refs`.
+    #[tool]
+    async fn cited_by(
+        &self,
+        Parameters(params): Parameters<CitationParams>,
+    ) -> Result<Json<SearchResults>, String> {
+        let options = params.paging.options()?;
+        let seed = params.reference;
+        let (root, config) = (self.root.clone(), self.config.clone());
+        let logged = off_thread(move || async move {
+            pax_core::cited_by_logged(&seed, &options, &root, &config).await
+        })
+        .await?
+        .map_err(|e| e.to_string())?;
+        Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
+    }
+
     /// Show one paper: a provider reference from `search` (resolved live), or
     /// the citation key of a paper already in the library.
     #[tool]
@@ -384,9 +430,10 @@ impl ServerHandler for PaxServer {
             .with_server_info(Implementation::new("pax-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Tools over a pax research library: search providers for papers, \
-                 show one, add it to the library, and list what's declared. \
-                 Writes go to research/ through pax-core, and searches are \
-                 recorded in research/search-log.jsonl.",
+                 follow a paper's references and citations, show one, add it to \
+                 the library, and list what's declared. Writes go to research/ \
+                 through pax-core, and searches are recorded in \
+                 research/search-log.jsonl.",
             )
     }
 }
@@ -627,7 +674,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         names.sort();
-        assert_eq!(names, ["add", "list", "search", "show"]);
+        assert_eq!(names, ["add", "cited_by", "list", "refs", "search", "show"]);
     }
 
     #[tokio::test]
@@ -916,6 +963,50 @@ mod tests {
         let status = log_status(LogOutcome::Failed(std::io::Error::other("disk full")));
         assert!(!status.logged);
         assert!(status.reason.unwrap().contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn refs_and_cited_by_refuse_an_invalid_seed_without_logging_it() {
+        let root = library_with_two_papers("citations");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let seed = |reference: &str| {
+            Parameters(CitationParams {
+                reference: reference.to_string(),
+                ..CitationParams::default()
+            })
+        };
+
+        let unknown_key = server
+            .refs(seed("dijkstra1968"))
+            .await
+            .err()
+            .expect("an unknown citation key should be refused");
+        assert!(unknown_key.contains("dijkstra1968"), "{unknown_key}");
+        let bad_reference = server
+            .cited_by(seed("nowhere:123"))
+            .await
+            .err()
+            .expect("an unknown provider should be refused");
+        assert!(bad_reference.contains("nowhere"), "{bad_reference}");
+        assert!(!root.join("research/search-log.jsonl").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refs_and_cited_by_reject_invalid_paging_before_any_lookup() {
+        let server = PaxServer::new(PathBuf::from("."), Config::default());
+        let params = || {
+            Parameters(CitationParams {
+                reference: "openalex:W2072794470".to_string(),
+                paging: PagingParams {
+                    doc_type: Some("blog-post".to_string()),
+                    ..PagingParams::default()
+                },
+            })
+        };
+        assert!(server.refs(params()).await.is_err());
+        assert!(server.cited_by(params()).await.is_err());
     }
 
     #[tokio::test]
