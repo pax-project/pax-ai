@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CandidateId, CandidateWork, Config, DocType, Filters, LibraryIndex, Limit, ListFilter,
-    LogOutcome, Logged, Paper, ProviderId, SearchOptions, SearchPage, ShowResult, YearRange,
+    LogOutcome, Logged, Paper, PaxError, ProviderId, SearchOptions, SearchPage, ShowResult,
+    YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -324,7 +325,8 @@ impl PaxServer {
     }
 
     /// Declare a search result in the library (metadata only; the PDF is
-    /// fetched separately). Returns the new paper's citation key.
+    /// fetched separately). Returns the new paper's citation key. A paper
+    /// already in the library (same DOI or arXiv id) is refused.
     #[tool]
     async fn add(
         &self,
@@ -333,7 +335,7 @@ impl PaxServer {
         let id: CandidateId = params.reference.parse().map_err(|e| format!("{e}"))?;
         let key = pax_core::add_candidate(&id, &self.root, &self.config)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(add_error)?;
         Ok(Json(Added {
             citation_key: key.0,
         }))
@@ -508,6 +510,19 @@ fn log_status(log: LogOutcome) -> SearchLogStatus {
             "writing the search log failed: {e}; the results still stand"
         )),
         other => not_logged(format!("not logged: {other:?}")),
+    }
+}
+
+/// Why `add` failed; a paper already in the library says so plainly, since
+/// an agent is expected to retry with another result rather than treat it
+/// as a failure.
+fn add_error(e: PaxError) -> String {
+    match e {
+        PaxError::AlreadyDeclared {
+            reference,
+            citation_key,
+        } => format!("not added: {reference} is already in the library as {citation_key:?}"),
+        other => other.to_string(),
     }
 }
 
@@ -901,6 +916,25 @@ mod tests {
         let status = log_status(LogOutcome::Failed(std::io::Error::other("disk full")));
         assert!(!status.logged);
         assert!(status.reason.unwrap().contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_paper_already_in_the_library() {
+        let root = library_with_two_papers("add-duplicate");
+        let server = PaxServer::new(root.clone(), Config::default());
+        // A Crossref reference names its DOI, so pax-core refuses it before
+        // resolving anything over the network.
+        let error = server
+            .add(Parameters(ReferenceParams {
+                reference: "crossref:10.1112/plms/s2-42.1.230".to_string(),
+            }))
+            .await
+            .err()
+            .expect("a declared paper should be refused");
+        assert!(error.contains("already in the library"), "{error}");
+        assert!(error.contains("turing1936"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
