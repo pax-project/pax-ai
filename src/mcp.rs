@@ -16,9 +16,9 @@ use std::path::PathBuf;
 
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
-    CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Filters, LibraryIndex, Limit,
-    ListFilter, LogOutcome, Logged, Paper, PaxError, ProviderId, SearchOptions, SearchPage,
-    ShowResult, YearRange,
+    CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, ExclusionStage, Filters,
+    LibraryIndex, Limit, ListFilter, LogOutcome, Logged, Paper, PaxError, ProviderId,
+    SearchOptions, SearchPage, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -104,6 +104,38 @@ pub struct ReferenceParams {
     /// A provider reference from `search` (e.g. `openalex:W2072794470`), or
     /// for `show` also a citation key already in the library.
     pub reference: String,
+}
+
+/// When in screening a paper was excluded; PRISMA reports the two apart.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stage {
+    /// Excluded from its title and abstract.
+    Screening,
+    /// Excluded after reading the full text.
+    FullText,
+}
+
+impl From<Stage> for ExclusionStage {
+    fn from(stage: Stage) -> Self {
+        match stage {
+            Stage::Screening => ExclusionStage::Screening,
+            Stage::FullText => ExclusionStage::FullText,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExcludeParams {
+    /// A DOI (bare or `https://doi.org/...`) or a provider reference from
+    /// `search`, e.g. `openalex:W2072794470`.
+    pub reference: String,
+    /// Why the paper is excluded, e.g. "not empirical". Required.
+    pub reason: String,
+    pub stage: Stage,
+    /// Title to record; overrides the provider's, and is needed when the
+    /// reference can't be resolved. With a bare DOI, no provider is asked.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -249,6 +281,18 @@ pub struct Added {
     pub citation_key: String,
 }
 
+/// An exclusion as recorded in `research/excluded.nix`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Excluded {
+    /// The key it's recorded under: the paper's DOI when known (so it's
+    /// excluded from every provider), else its provider reference.
+    pub key: String,
+    pub title: String,
+    pub reason: String,
+    /// `screening` or `full-text`.
+    pub stage: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PaperList {
     pub papers: Vec<DeclaredPaper>,
@@ -387,6 +431,37 @@ impl PaxServer {
         }))
     }
 
+    /// Exclude a paper from the review: record it in research/excluded.nix
+    /// with a reason and a stage (`screening` or `full-text`), replacing any
+    /// earlier exclusion of it. Excluded papers are flagged in `search`,
+    /// `refs`, and `cited_by` results. A paper declared in the library is
+    /// refused; it must be removed first.
+    #[tool]
+    async fn exclude(
+        &self,
+        Parameters(params): Parameters<ExcludeParams>,
+    ) -> Result<Json<Excluded>, String> {
+        let exclusion = pax_core::exclude_paper(
+            &params.reference,
+            &params.reason,
+            params.stage.into(),
+            params.title.as_deref(),
+            &self.root,
+            &self.config,
+        )
+        .await
+        .map_err(|e| match e {
+            PaxError::ExclusionTitleUnresolved(..) => format!("{e} with `title`"),
+            other => other.to_string(),
+        })?;
+        Ok(Json(Excluded {
+            key: exclusion.key,
+            title: exclusion.title,
+            reason: exclusion.reason,
+            stage: exclusion.stage.to_string(),
+        }))
+    }
+
     /// List the papers declared in the library, optionally filtered by author,
     /// year, and tag (all combined with AND).
     #[tool]
@@ -431,7 +506,8 @@ impl ServerHandler for PaxServer {
             .with_instructions(
                 "Tools over a pax research library: search providers for papers, \
                  follow a paper's references and citations, show one, add it to \
-                 the library, and list what's declared. Writes go to research/ \
+                 the library or exclude it with a reason, and list what's \
+                 declared. Writes go to research/ \
                  through pax-core, and searches are recorded in \
                  research/search-log.jsonl.",
             )
@@ -604,7 +680,7 @@ fn declared(paper: &Paper) -> DeclaredPaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pax_core::{Exclusion, ExclusionStage, Exclusions, Library, ProviderError};
+    use pax_core::{Exclusion, Exclusions, Library, ProviderError};
     use std::fs;
 
     fn library_with_two_papers(name: &str) -> PathBuf {
@@ -674,7 +750,12 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         names.sort();
-        assert_eq!(names, ["add", "cited_by", "list", "refs", "search", "show"]);
+        assert_eq!(
+            names,
+            [
+                "add", "cited_by", "exclude", "list", "refs", "search", "show"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1007,6 +1088,98 @@ mod tests {
         };
         assert!(server.refs(params()).await.is_err());
         assert!(server.cited_by(params()).await.is_err());
+    }
+
+    fn exclusion(reference: &str, reason: &str, title: Option<&str>) -> Parameters<ExcludeParams> {
+        Parameters(ExcludeParams {
+            reference: reference.to_string(),
+            reason: reason.to_string(),
+            stage: Stage::FullText,
+            title: title.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn exclude_records_a_doi_with_a_title_without_the_network() {
+        let root = library_with_two_papers("exclude");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(excluded) = server
+            .exclude(exclusion(
+                "https://doi.org/10.1000/Off-Topic",
+                "not empirical",
+                Some("An Essay"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(excluded.key, "10.1000/off-topic");
+        assert_eq!(excluded.stage, "full-text");
+        assert_eq!(
+            (excluded.title.as_str(), excluded.reason.as_str()),
+            ("An Essay", "not empirical")
+        );
+
+        let excluded_work = work(
+            ProviderId::OpenAlex,
+            "W9",
+            "An Essay",
+            Some("10.1000/off-topic"),
+        );
+        assert!(LibraryIndex::load(&root).is_excluded(&excluded_work));
+        let Json(listed) = server
+            .list(Parameters(ListParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(listed.papers.len(), 2, "excluding doesn't declare anything");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclude_refuses_a_missing_reason_and_a_declared_paper() {
+        let root = library_with_two_papers("exclude-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let no_reason = server
+            .exclude(exclusion("10.1000/x", "  ", Some("X")))
+            .await
+            .err()
+            .expect("an empty reason should be refused");
+        assert!(no_reason.contains("reason"), "{no_reason}");
+
+        let declared = server
+            .exclude(exclusion(
+                "10.1112/plms/s2-42.1.230",
+                "out of scope",
+                Some("On Computable Numbers"),
+            ))
+            .await
+            .err()
+            .expect("a declared paper should be refused");
+        assert!(declared.contains("turing1936"), "{declared}");
+        assert!(!root.join("research/excluded.nix").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclude_params_take_only_known_stages() {
+        let params = |stage: &str| {
+            serde_json::from_value::<ExcludeParams>(serde_json::json!({
+                "reference": "10.1000/x",
+                "reason": "r",
+                "stage": stage,
+            }))
+        };
+        assert!(matches!(
+            ExclusionStage::from(params("screening").unwrap().stage),
+            ExclusionStage::Screening
+        ));
+        assert!(matches!(
+            ExclusionStage::from(params("full-text").unwrap().stage),
+            ExclusionStage::FullText
+        ));
+        assert!(params("abstract").is_err());
     }
 
     #[tokio::test]
