@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::future::Future;
 use std::path::PathBuf;
 
 use pax_core::merge::PROVIDER_ORDER;
@@ -329,19 +328,13 @@ impl PaxServer {
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResults>, String> {
         let options = params.paging.options()?;
-        let (root, config) = (self.root.clone(), self.config.clone());
+        let (root, config) = (&self.root, &self.config);
         let logged = match (params.query, params.author) {
             (Some(query), None) => {
-                off_thread(move || async move {
-                    pax_core::search_all_logged(&query, &options, &root, &config).await
-                })
-                .await?
+                pax_core::search_all_logged(&query, &options, root, config).await
             }
             (None, Some(author)) => {
-                off_thread(move || async move {
-                    pax_core::search_by_author_logged(&author, &options, &root, &config).await
-                })
-                .await?
+                pax_core::search_by_author_logged(&author, &options, root, config).await
             }
             _ => return Err("give exactly one of `query` or `author`".to_string()),
         };
@@ -358,13 +351,10 @@ impl PaxServer {
         Parameters(params): Parameters<CitationParams>,
     ) -> Result<Json<SearchResults>, String> {
         let options = params.paging.options()?;
-        let seed = params.reference;
-        let (root, config) = (self.root.clone(), self.config.clone());
-        let logged = off_thread(move || async move {
-            pax_core::references_logged(&seed, &options, &root, &config).await
-        })
-        .await?
-        .map_err(|e| e.to_string())?;
+        let logged =
+            pax_core::references_logged(&params.reference, &options, &self.root, &self.config)
+                .await
+                .map_err(|e| e.to_string())?;
         Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
     }
 
@@ -375,13 +365,10 @@ impl PaxServer {
         Parameters(params): Parameters<CitationParams>,
     ) -> Result<Json<SearchResults>, String> {
         let options = params.paging.options()?;
-        let seed = params.reference;
-        let (root, config) = (self.root.clone(), self.config.clone());
-        let logged = off_thread(move || async move {
-            pax_core::cited_by_logged(&seed, &options, &root, &config).await
-        })
-        .await?
-        .map_err(|e| e.to_string())?;
+        let logged =
+            pax_core::cited_by_logged(&params.reference, &options, &self.root, &self.config)
+                .await
+                .map_err(|e| e.to_string())?;
         Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
     }
 
@@ -512,23 +499,6 @@ impl ServerHandler for PaxServer {
                  research/search-log.jsonl.",
             )
     }
-}
-
-/// Runs a `pax-core` call on a blocking-pool thread, off the request path.
-/// Needed for paged searches: their futures aren't `Send` (Crossref's
-/// language filter keeps its state in a `RefCell`), so they can't be awaited
-/// in a tool handler directly. The future is built and driven on that one
-/// thread, by the server's runtime.
-async fn off_thread<F, Fut, T>(make: F) -> Result<T, String>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = T>,
-    T: Send + 'static,
-{
-    let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || runtime.block_on(make()))
-        .await
-        .map_err(|e| format!("the request failed to run: {e}"))
 }
 
 /// Per-provider reports, in `providers` order, and the successful pages
