@@ -20,8 +20,9 @@ Early: the LLM port with Anthropic and Ollama adapters, cached summaries, and a 
 - `add`: declare a search result in `research/papers.nix`. A paper already in the library is refused.
 - `exclude`: record a paper in `research/excluded.nix` with a required `reason` and a `stage` (`screening` or `full-text`), and an optional `title`.
 - `list`: declared papers, filtered by author, year, and tag.
+- `stats`: the review's PRISMA 2020 flow-diagram counts (records identified per provider, duplicates removed, records screened, exclusions per stage with full-text reasons, reports not retrieved, papers included), computed by pax-core from the library's files.
 
-`search`, `refs`, and `cited_by` are recorded in `research/search-log.jsonl`, the same log the `pax` CLI writes, and each result's `log` says whether it was recorded and, if not, why. A `stats` tool follows once pax-core has the call behind it.
+`search`, `refs`, and `cited_by` are recorded in `research/search-log.jsonl`, the same log the `pax` CLI writes, and each result's `log` says whether it was recorded and, if not, why.
 
 ```Bash
 cargo build --release --bin pax-mcp
