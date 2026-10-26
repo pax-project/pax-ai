@@ -1153,8 +1153,9 @@ dependencies = [
 
 [[package]]
 name = "pax-core-papers"
-version = "1.1.1"
-source = "git+https://github.com/pax-project/pax-core?rev=8f90564943a823d0d12211ca6d3a1a2e00bd8fa6#8f90564943a823d0d12211ca6d3a1a2e00bd8fa6"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc54b54a0923b2ca448091ee068a7df030e09edc337f88b6ce96283feb9027ea"
 dependencies = [
  "arxiv-tools",
  "chrono",
