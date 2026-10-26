@@ -9,7 +9,7 @@
 //! module's own serializable types, since `pax-core`'s don't derive
 //! `Serialize`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::path::PathBuf;
 
@@ -292,6 +292,54 @@ pub struct Excluded {
     pub stage: String,
 }
 
+/// A library's PRISMA 2020 flow-diagram counts, computed by pax-core from
+/// the search log, the exclusions, and the declared papers.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PrismaStats {
+    pub identified: Identified,
+    /// `identified.total - records_screened`, across the whole log.
+    pub duplicates_removed: usize,
+    /// Distinct papers among every record identified.
+    pub records_screened: usize,
+    /// Papers excluded at title/abstract screening.
+    pub excluded_screening: usize,
+    /// `records_screened - excluded_screening`.
+    pub reports_sought: usize,
+    /// Declared papers with no fetchable artifact (no `source_url` or no
+    /// `hash`).
+    pub not_retrieved: usize,
+    /// `reports_sought - not_retrieved`.
+    pub reports_assessed: usize,
+    pub excluded_full_text: FullTextExclusions,
+    /// Declared papers with a fetchable artifact.
+    pub included: usize,
+    /// Search-log lines whose provider failed; they count nowhere else.
+    pub skipped_log_lines: usize,
+}
+
+/// Records identified, per provider tag (e.g. `openalex`).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Identified {
+    /// From database searches (`search`).
+    pub databases: BTreeMap<String, usize>,
+    /// From citation searching (`refs`, `cited_by`).
+    pub citation_searching: BTreeMap<String, usize>,
+    pub total: usize,
+}
+
+/// Papers excluded after reading the full text, by reason.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FullTextExclusions {
+    pub total: usize,
+    pub reasons: Vec<ReasonCount>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReasonCount {
+    pub reason: String,
+    pub count: usize,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PaperList {
     pub papers: Vec<DeclaredPaper>,
@@ -449,6 +497,23 @@ impl PaxServer {
         }))
     }
 
+    /// The review's PRISMA 2020 flow-diagram counts: records identified per
+    /// provider (database searches and citation searching), duplicates
+    /// removed, records screened, exclusions at each stage (full-text ones
+    /// by reason), reports not retrieved, and papers included. Computed from
+    /// the library's files; nothing is written.
+    #[tool]
+    async fn stats(&self) -> Result<Json<PrismaStats>, String> {
+        if !pax_core::nix::papers_path(&self.root).exists() {
+            return Err(format!(
+                "no pax library at {} (research/papers.nix not found)",
+                self.root.display()
+            ));
+        }
+        let stats = pax_core::stats(&self.root).map_err(|e| e.to_string())?;
+        Ok(Json(prisma_stats(stats)))
+    }
+
     /// List the papers declared in the library, optionally filtered by author,
     /// year, and tag (all combined with AND).
     #[tool]
@@ -493,8 +558,8 @@ impl ServerHandler for PaxServer {
             .with_instructions(
                 "Tools over a pax research library: search providers for papers, \
                  follow a paper's references and citations, show one, add it to \
-                 the library or exclude it with a reason, and list what's \
-                 declared. Writes go to research/ \
+                 the library or exclude it with a reason, list what's declared, \
+                 and report PRISMA flow counts. Writes go to research/ \
                  through pax-core, and searches are recorded in \
                  research/search-log.jsonl.",
             )
@@ -633,6 +698,36 @@ fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidat
     }
 }
 
+fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
+    PrismaStats {
+        identified: Identified {
+            databases: stats.identified.databases,
+            citation_searching: stats.identified.citation_searching,
+            total: stats.identified.total,
+        },
+        duplicates_removed: stats.duplicates_removed,
+        records_screened: stats.records_screened,
+        excluded_screening: stats.excluded_screening,
+        reports_sought: stats.reports_sought,
+        not_retrieved: stats.not_retrieved,
+        reports_assessed: stats.reports_assessed,
+        excluded_full_text: FullTextExclusions {
+            total: stats.excluded_full_text.total,
+            reasons: stats
+                .excluded_full_text
+                .reasons
+                .into_iter()
+                .map(|r| ReasonCount {
+                    reason: r.reason,
+                    count: r.count,
+                })
+                .collect(),
+        },
+        included: stats.included,
+        skipped_log_lines: stats.skipped_log_lines,
+    }
+}
+
 fn declared(paper: &Paper) -> DeclaredPaper {
     DeclaredPaper {
         citation_key: paper.local.citation_key.clone(),
@@ -723,7 +818,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "add", "cited_by", "exclude", "list", "refs", "search", "show"
+                "add", "cited_by", "exclude", "list", "refs", "search", "show", "stats"
             ]
         );
     }
@@ -1150,6 +1245,68 @@ mod tests {
             ExclusionStage::FullText
         ));
         assert!(params("abstract").is_err());
+    }
+
+    #[tokio::test]
+    async fn stats_counts_the_logged_search_and_the_exclusions() {
+        let root = library_with_two_papers("stats");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let page = SearchPage::new(
+            vec![
+                work(
+                    ProviderId::OpenAlex,
+                    "W1",
+                    "On Computable Numbers",
+                    Some("10.1112/plms/s2-42.1.230"),
+                ),
+                work(
+                    ProviderId::OpenAlex,
+                    "W2",
+                    "An Essay",
+                    Some("10.1000/essay"),
+                ),
+            ],
+            Some(2),
+            None,
+        );
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> =
+            HashMap::from([(ProviderId::OpenAlex, Ok(page))]);
+        let logged = pax_core::log_results(
+            &root,
+            pax_core::SearchCommand::Search,
+            "computable",
+            &SearchOptions::default(),
+            &results,
+        );
+        assert!(matches!(logged, LogOutcome::Written(_)));
+        server
+            .exclude(exclusion(
+                "10.1000/essay",
+                "not empirical",
+                Some("An Essay"),
+            ))
+            .await
+            .unwrap();
+
+        let Json(stats) = server.stats().await.unwrap();
+        assert_eq!(stats.identified.databases.get("openalex"), Some(&2));
+        assert_eq!(stats.identified.total, 2);
+        assert_eq!(stats.records_screened, 2);
+        assert_eq!(stats.duplicates_removed, 0);
+        assert_eq!(stats.excluded_full_text.total, 1);
+        assert_eq!(stats.excluded_full_text.reasons[0].reason, "not empirical");
+        assert_eq!(stats.excluded_full_text.reasons[0].count, 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_without_a_library_is_a_clear_error() {
+        let root =
+            std::env::temp_dir().join(format!("pax-mcp-test-no-library-{}", std::process::id()));
+        let server = PaxServer::new(root, Config::default());
+        let error = server.stats().await.err().expect("stats needs a library");
+        assert!(error.contains("no pax library"), "{error}");
     }
 
     #[tokio::test]
