@@ -42,3 +42,12 @@ cargo clippy  # lint
 ## Dependency on `pax-core`
 
 crates.io dependency on the published `pax-core-papers` package, aliased back to `pax-core` (its lib name is still `pax_core`), `default-features = false` (the `cli` feature — and its `clap`/`dotenvy`/`tokio` deps — stays off), same as `lazy-pax`. Moving to a later `pax-core` release is a deliberate, explicit step, not automatic.
+
+pax-core 2.0's enums and several of its structs are `#[non_exhaustive]`: matches on them need a wildcard arm, and its structs are built with `new`/`with_*`, not literals.
+
+## MCP server notes
+
+- Tools return this crate's own `Serialize` + `JsonSchema` types (`src/mcp.rs`), since pax-core's types don't derive `JsonSchema` (most don't derive `Serialize` either). Conversion lives in plain functions (`search_results`, `log_status`, `prisma_stats`, …) so it's testable without the network.
+- `search`, `refs`, and `cited_by` call pax-core's `*_logged` variants, so an agent's searches land in `research/search-log.jsonl` with the CLI's; the result's `log` says when nothing was logged (no library, or the write failed). Never call the unlogged `search_*`/`references`/`cited_by` from a tool.
+- In-library/excluded flags come from `LibraryIndex`, which matches by DOI or arXiv id; don't use the deprecated `known_dois`/`excluded_keys`.
+- Tests use a fixture library in a temp dir and no network: tools that need a provider are tested on argument validation and on the conversion functions with hand-built `SearchPage`s.
