@@ -11,14 +11,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
-    Exclusion, ExclusionStage, Filters, Library, LibraryIndex, Limit, ListFilter, LogOutcome,
-    Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderId, SearchOptions, SearchPage,
-    SeedResults, ShowResult, YearRange,
+    Exclusion, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter,
+    LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderId, ResolvedArtifact,
+    SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -120,6 +121,12 @@ impl CitationParams {
 pub struct ReferenceParams {
     /// A provider reference from `search` (e.g. `openalex:W2072794470`), or
     /// for `show` also a citation key already in the library.
+    pub reference: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CitationKeyParams {
+    /// The citation key of a paper in the library, e.g. `turing1936`.
     pub reference: String,
 }
 
@@ -512,6 +519,43 @@ pub struct CheckResults {
     pub errored: usize,
 }
 
+/// How a `fetch` ended. Only `fetched` and `already-fetched` have a
+/// `store_path`; every other state says in `reason` what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum FetchState {
+    /// Downloaded now: its hash is recorded in `papers.nix` and the PDF is in
+    /// the Nix store.
+    Fetched,
+    /// Its hash was already recorded; the PDF is in the Nix store.
+    AlreadyFetched,
+    /// No `source_url` is recorded (the provider found no open-access copy),
+    /// so there's nothing to download.
+    NoSourceUrl,
+    /// Downloading failed (network error, 404, `nix` failure); nothing was
+    /// recorded.
+    FetchFailed,
+    /// The source no longer matches the recorded hash.
+    HashMismatch,
+    /// The hash is recorded, but `nix build` couldn't produce the PDF.
+    BuildFailed,
+    /// `nix` didn't finish in time; the hash may still be recorded once it
+    /// does.
+    TimedOut,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FetchResult {
+    pub citation_key: String,
+    pub status: FetchState,
+    /// The recorded Nix hash, when there is one.
+    pub hash: Option<String>,
+    /// The PDF's Nix store path.
+    pub store_path: Option<String>,
+    /// Why there's no store path, and what to do about it.
+    pub reason: Option<String>,
+}
+
 /// Serves one research library: `root` is the directory containing
 /// `research/`, as for the `pax` CLI.
 #[derive(Clone)]
@@ -778,6 +822,38 @@ impl PaxServer {
             .map_err(|e| format!("check didn't finish: {e}"))?
             .map_err(|e| e.to_string())?;
         Ok(Json(check_results(reports)))
+    }
+
+    /// Download a declared paper's PDF through Nix: records its hash in
+    /// `papers.nix` (unless already recorded), then builds it into the Nix
+    /// store and returns the path. Can take minutes; it gives up after a
+    /// timeout. A paper that can't be fetched (no source URL, download or
+    /// build failure, hash mismatch) is reported in `status` and `reason`,
+    /// not as an error.
+    #[tool]
+    async fn fetch(
+        &self,
+        Parameters(params): Parameters<CitationKeyParams>,
+    ) -> Result<Json<FetchResult>, String> {
+        self.papers_path()?;
+        let (key, root) = (params.reference.clone(), self.root.clone());
+        let attempt =
+            blocking_with_timeout(FETCH_TIMEOUT, move || fetch_and_build(&key, &root)).await?;
+        let result = match attempt {
+            Some(attempt) => fetch_result(&params.reference, attempt)?,
+            None => FetchResult {
+                citation_key: params.reference,
+                status: FetchState::TimedOut,
+                hash: None,
+                store_path: None,
+                reason: Some(format!(
+                    "nix didn't finish within {}s; it may still record the hash, so call \
+                     `fetch` again later",
+                    FETCH_TIMEOUT.as_secs()
+                )),
+            },
+        };
+        Ok(Json(result))
     }
 }
 
@@ -1141,6 +1217,99 @@ fn select_papers(
         .collect())
 }
 
+/// How long `fetch` waits. pax-core already bounds each `nix` call it makes
+/// (prefetch, then `git add` and build), so this only caps their sum.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Runs blocking work (a `nix` call) on tokio's blocking pool, so it never
+/// stalls the server's executor; `None` once `timeout` passes. The work
+/// itself can't be cancelled and runs on to its end in the background.
+async fn blocking_with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<Option<T>, String> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
+        Ok(joined) => joined
+            .map(Some)
+            .map_err(|e| format!("the task failed: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `fetch`'s two pax-core steps: record the hash (downloading, unless one is
+/// recorded already), then build the PDF to get its store path.
+type FetchAttempt = Result<(FetchOutcome, Result<ResolvedArtifact, PaxError>), PaxError>;
+
+fn fetch_and_build(citation_key: &str, root: &Path) -> FetchAttempt {
+    let outcome = pax_core::fetch_paper(citation_key, root)?;
+    Ok((outcome, pax_core::resolve_artifact_path(citation_key, root)))
+}
+
+/// What a fetch attempt means for the agent. Only a bad citation key or an
+/// unreadable library is an error; a paper that can't be fetched is a
+/// result, with the reason.
+fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult, String> {
+    let result = |status, hash: Option<String>, reason: String| FetchResult {
+        citation_key: citation_key.to_string(),
+        status,
+        hash,
+        store_path: None,
+        reason: Some(reason),
+    };
+    let (outcome, built) = match attempt {
+        Ok(fetched) => fetched,
+        Err(PaxError::NoSourceUrl(_)) => {
+            return Ok(result(
+                FetchState::NoSourceUrl,
+                None,
+                "no PDF source is recorded (the provider found no open-access copy when it \
+                 was added), so there's nothing to fetch; record one with `pax edit \
+                 --source-url`"
+                    .to_string(),
+            ));
+        }
+        Err(e @ PaxError::Fetch(_)) => {
+            return Ok(result(FetchState::FetchFailed, None, e.to_string()));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let (status, hash) = match outcome {
+        FetchOutcome::Fetched { hash } => (FetchState::Fetched, hash),
+        FetchOutcome::AlreadyFetched { hash } => (FetchState::AlreadyFetched, hash),
+    };
+    Ok(match built {
+        Ok(ResolvedArtifact::Path(path)) => FetchResult {
+            citation_key: citation_key.to_string(),
+            status,
+            hash: Some(hash),
+            store_path: Some(path.display().to_string()),
+            reason: None,
+        },
+        Err(PaxError::Build(message)) if message.contains("hash mismatch") => result(
+            FetchState::HashMismatch,
+            Some(hash),
+            format!(
+                "the source no longer matches the recorded hash; `check` reports it too: \
+                 {message}"
+            ),
+        ),
+        Err(PaxError::Build(message)) if message.contains("not tracked by Git") => result(
+            FetchState::BuildFailed,
+            Some(hash),
+            format!(
+                "research/ isn't tracked by git, and nix only sees tracked files; `git add` \
+                 it in the repository that holds it, then fetch again: {message}"
+            ),
+        ),
+        Err(e) => result(FetchState::BuildFailed, Some(hash), e.to_string()),
+        Ok(_) => result(
+            FetchState::BuildFailed,
+            Some(hash),
+            "the hash is recorded, but the PDF still couldn't be resolved".to_string(),
+        ),
+    })
+}
+
 fn check_results(reports: Vec<CheckReport>) -> CheckResults {
     let papers: Vec<PaperCheck> = reports
         .into_iter()
@@ -1320,6 +1489,7 @@ mod tests {
                 "edit",
                 "exclude",
                 "export",
+                "fetch",
                 "list",
                 "refs",
                 "search",
@@ -2250,5 +2420,109 @@ mod tests {
         assert_eq!(out.papers[1].actual.as_deref(), Some("sha256-new"));
         assert_eq!(out.papers[2].error.as_deref(), Some("fetch failed: 404"));
         assert!(out.papers[0].error.is_none() && out.papers[0].expected.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_a_paper_without_a_source_url_without_running_nix() {
+        let root = library_with_two_papers("fetch");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let Json(result) = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "hewitt1973".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.status, FetchState::NoSourceUrl);
+        assert!(result.store_path.is_none() && result.hash.is_none());
+        assert!(result.reason.unwrap().contains("source"));
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        let unknown = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "dijkstra1968".to_string(),
+            }))
+            .await
+            .err()
+            .expect("an unknown citation key should be refused");
+        assert!(unknown.contains("dijkstra1968"), "{unknown}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fetch_results_say_what_happened_and_what_to_do() {
+        let built = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::Fetched {
+                    hash: "sha256-new".to_string(),
+                },
+                Ok(ResolvedArtifact::Path(PathBuf::from("/nix/store/x-turing"))),
+            )),
+        )
+        .unwrap();
+        assert_eq!(built.status, FetchState::Fetched);
+        assert_eq!(built.hash.as_deref(), Some("sha256-new"));
+        assert_eq!(built.store_path.as_deref(), Some("/nix/store/x-turing"));
+        assert!(built.reason.is_none());
+
+        let mismatch = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::AlreadyFetched {
+                    hash: "sha256-old".to_string(),
+                },
+                Err(PaxError::Build(
+                    "error: hash mismatch in fixed-output derivation".to_string(),
+                )),
+            )),
+        )
+        .unwrap();
+        assert_eq!(mismatch.status, FetchState::HashMismatch);
+        assert_eq!(mismatch.hash.as_deref(), Some("sha256-old"));
+        assert!(mismatch.store_path.is_none());
+
+        let untracked = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::AlreadyFetched {
+                    hash: "sha256-old".to_string(),
+                },
+                Err(PaxError::Build(
+                    "error: path 'research/papers.nix' is not tracked by Git".to_string(),
+                )),
+            )),
+        )
+        .unwrap();
+        assert_eq!(untracked.status, FetchState::BuildFailed);
+        assert!(untracked.reason.unwrap().contains("git add"));
+
+        let failed = fetch_result(
+            "turing1936",
+            Err(PaxError::Fetch("`nix` timed out after 60s".to_string())),
+        )
+        .unwrap();
+        assert_eq!(failed.status, FetchState::FetchFailed);
+        assert!(failed.hash.is_none());
+        assert!(failed.reason.unwrap().contains("timed out"));
+
+        assert!(fetch_result("x", Err(PaxError::NoSuchPaper("x".to_string()))).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocking_work_past_its_timeout_is_reported_as_none() {
+        let slow = blocking_with_timeout(Duration::from_millis(10), || {
+            std::thread::sleep(Duration::from_millis(500));
+        })
+        .await
+        .unwrap();
+        assert!(slow.is_none());
+        let quick = blocking_with_timeout(Duration::from_secs(5), || 42)
+            .await
+            .unwrap();
+        assert_eq!(quick, Some(42));
     }
 }
