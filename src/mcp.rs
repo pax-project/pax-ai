@@ -18,8 +18,8 @@ use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
     Exclusion, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter,
-    LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderId, ResolvedArtifact,
-    SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
+    LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderError, ProviderId,
+    ResolvedArtifact, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -119,9 +119,20 @@ impl CitationParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReferenceParams {
-    /// A provider reference from `search` (e.g. `openalex:W2072794470`), or
-    /// for `show` also a citation key already in the library.
+    /// A provider reference from `search`, e.g. `openalex:W2072794470`.
     pub reference: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ShowParams {
+    /// A provider reference from `search` (e.g. `openalex:W2072794470`) or the
+    /// citation key of a paper in the library. Give exactly one of
+    /// `reference` or `doi`.
+    pub reference: Option<String>,
+    /// A DOI (bare or `https://doi.org/...`), looked up at every provider
+    /// that resolves DOIs, since one DOI can match several providers'
+    /// records.
+    pub doi: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -382,12 +393,35 @@ pub struct DeclaredPaper {
     pub fetched: bool,
 }
 
-/// Exactly one of the two fields is set, depending on whether the reference
-/// named a declared paper (citation key) or a provider candidate.
+/// What one provider returned for a DOI.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DoiLookup {
+    pub provider: String,
+    /// Whether the provider has a record for the DOI.
+    pub found: bool,
+    /// Set when the lookup failed (not when the provider just has no
+    /// record); the other providers' records still stand.
+    pub error: Option<String>,
+}
+
+/// Every provider's record of a DOI, merged as `search` merges results.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DoiRecords {
+    /// The DOI looked up, normalized.
+    pub doi: String,
+    /// The providers that resolve DOIs (arXiv doesn't).
+    pub providers: Vec<DoiLookup>,
+    /// Normally one paper; more if the providers' records don't merge.
+    pub results: Vec<MergedHit>,
+}
+
+/// Exactly one field is set: `declared` for a citation key, `candidate` for
+/// a provider reference, `records` for a DOI.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ShowOutput {
     pub declared: Option<DeclaredPaper>,
     pub candidate: Option<Candidate>,
+    pub records: Option<DoiRecords>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -639,20 +673,38 @@ impl PaxServer {
         self.citations(logged).map(Json)
     }
 
-    /// Show one paper: a provider reference from `search` (resolved live), or
-    /// the citation key of a paper already in the library.
+    /// Show one paper: by a provider reference from `search` (resolved live),
+    /// the citation key of a paper already in the library, or a DOI. A DOI is
+    /// looked up at every provider that resolves DOIs, and their records come
+    /// back merged as in `search`, flagged if in the library or excluded.
+    /// DOI lookups aren't recorded in the search log.
     #[tool]
     async fn show(
         &self,
-        Parameters(params): Parameters<ReferenceParams>,
+        Parameters(params): Parameters<ShowParams>,
     ) -> Result<Json<ShowOutput>, String> {
-        let shown = pax_core::show_reference(&params.reference, &self.root, &self.config)
+        let reference = match (params.reference, params.doi) {
+            (Some(reference), None) => reference,
+            (None, Some(doi)) => {
+                let doi = doi_param(&doi)?;
+                let results = pax_core::search_by_doi(&doi, &self.config).await;
+                let index = LibraryIndex::load(&self.root);
+                return Ok(Json(ShowOutput {
+                    declared: None,
+                    candidate: None,
+                    records: Some(doi_records(doi, &results, &index)),
+                }));
+            }
+            _ => return Err("give exactly one of `reference` or `doi`".to_string()),
+        };
+        let shown = pax_core::show_reference(&reference, &self.root, &self.config)
             .await
             .map_err(|e| e.to_string())?;
         Ok(Json(match shown {
             ShowResult::Declared(paper) => ShowOutput {
                 declared: Some(declared(&paper)),
                 candidate: None,
+                records: None,
             },
             ShowResult::Candidate(work) => {
                 let index = LibraryIndex::load(&self.root);
@@ -663,6 +715,7 @@ impl PaxServer {
                         index.contains(&work),
                         index.is_excluded(&work),
                     )),
+                    records: None,
                 }
             }
         }))
@@ -1071,6 +1124,60 @@ fn merged_hit(
     }
 }
 
+/// Every provider's answer for a DOI, in `PROVIDER_ORDER`, and the records
+/// found merged into one list flagged against `index`.
+fn doi_records(
+    doi: String,
+    results: &HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>>,
+    index: &LibraryIndex,
+) -> DoiRecords {
+    let providers = PROVIDER_ORDER
+        .iter()
+        .filter_map(|provider| {
+            let result = results.get(provider)?;
+            Some(DoiLookup {
+                provider: provider.to_string(),
+                found: result.as_ref().is_ok_and(|works| !works.is_empty()),
+                error: match result {
+                    Err(ProviderError::NotFound) | Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                },
+            })
+        })
+        .collect();
+    let merged = pax_core::merge_works(
+        PROVIDER_ORDER
+            .iter()
+            .filter_map(|provider| results.get(provider)?.as_ref().ok())
+            .flatten()
+            .cloned(),
+    );
+    DoiRecords {
+        doi,
+        providers,
+        results: merged
+            .works
+            .iter()
+            .map(|merged| merged_hit(merged, index, &|_: &CandidateWork| false))
+            .collect(),
+    }
+}
+
+/// The DOI `show` looks up: trimmed and without a `https://doi.org/` prefix,
+/// refused unless it looks like one (`10.<registrant>/<suffix>`), so a
+/// provider reference passed as `doi` fails before any request.
+fn doi_param(doi: &str) -> Result<String, String> {
+    let doi = pax_core::normalize_doi(doi.trim());
+    match doi.split_once('/') {
+        Some((prefix, suffix)) if prefix.starts_with("10.") && !suffix.is_empty() => {
+            Ok(doi.to_string())
+        }
+        _ => Err(format!(
+            "{doi:?} is not a DOI (expected e.g. `10.1145/359545.359563`)"
+        )),
+    }
+}
+
 fn provider_report<E: Display>(
     provider: ProviderId,
     result: &Result<SearchPage, E>,
@@ -1410,7 +1517,7 @@ fn declared(paper: &Paper) -> DeclaredPaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pax_core::{Exclusion, Exclusions, Library, ProviderError};
+    use pax_core::{Exclusion, Exclusions};
     use std::fs;
 
     fn library_with_two_papers(name: &str) -> PathBuf {
@@ -1531,8 +1638,9 @@ mod tests {
         let server = PaxServer::new(root.clone(), Config::default());
 
         let Json(shown) = server
-            .show(Parameters(ReferenceParams {
-                reference: "hewitt1973".to_string(),
+            .show(Parameters(ShowParams {
+                reference: Some("hewitt1973".to_string()),
+                ..ShowParams::default()
             }))
             .await
             .unwrap();
@@ -2524,5 +2632,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(quick, Some(42));
+    }
+
+    #[tokio::test]
+    async fn show_takes_exactly_one_of_reference_or_doi() {
+        let server = PaxServer::new(PathBuf::from("."), Config::default());
+        let both_or_neither = [
+            ShowParams::default(),
+            ShowParams {
+                reference: Some("openalex:W2072794470".to_string()),
+                doi: Some("10.1145/359545.359563".to_string()),
+            },
+        ];
+        for params in both_or_neither {
+            let error = server
+                .show(Parameters(params))
+                .await
+                .err()
+                .expect("both or neither should be refused");
+            assert!(error.contains("exactly one"), "{error}");
+        }
+
+        let not_a_doi = server
+            .show(Parameters(ShowParams {
+                doi: Some("openalex:W2072794470".to_string()),
+                ..ShowParams::default()
+            }))
+            .await
+            .err()
+            .expect("a provider reference isn't a DOI");
+        assert!(not_a_doi.contains("not a DOI"), "{not_a_doi}");
+    }
+
+    #[test]
+    fn doi_params_are_normalized() {
+        assert_eq!(
+            doi_param(" https://doi.org/10.1112/plms/s2-42.1.230 ").unwrap(),
+            "10.1112/plms/s2-42.1.230"
+        );
+        for invalid in ["", "10.1112", "10.1112/", "turing1936"] {
+            assert!(doi_param(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn doi_records_merge_providers_and_flag_the_library() {
+        let root = library_with_two_papers("doi-records");
+        let index = LibraryIndex::load(&root);
+        let turing = "10.1112/plms/s2-42.1.230";
+        let results: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([
+                (
+                    ProviderId::OpenAlex,
+                    Ok(vec![work(
+                        ProviderId::OpenAlex,
+                        "W1",
+                        "On Computable Numbers",
+                        Some(turing),
+                    )]),
+                ),
+                (
+                    ProviderId::Crossref,
+                    Ok(vec![work(
+                        ProviderId::Crossref,
+                        turing,
+                        "On Computable Numbers",
+                        Some(turing),
+                    )]),
+                ),
+                (ProviderId::SemanticScholar, Err(ProviderError::NotFound)),
+            ]);
+
+        let out = doi_records(turing.to_string(), &results, &index);
+
+        let lookups: Vec<_> = out
+            .providers
+            .iter()
+            .map(|p| (p.provider.as_str(), p.found, p.error.is_some()))
+            .collect();
+        assert_eq!(
+            lookups,
+            [
+                ("openalex", true, false),
+                ("crossref", true, false),
+                ("semanticscholar", false, false),
+            ]
+        );
+        assert_eq!(out.results.len(), 1);
+        let hit = &out.results[0];
+        assert_eq!(hit.providers, ["openalex", "crossref"]);
+        assert!(hit.work.in_library && !hit.work.excluded);
+
+        let failed: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([(
+                ProviderId::OpenAlex,
+                Err(ProviderError::Request("timed out".to_string())),
+            )]);
+        let out = doi_records(turing.to_string(), &failed, &index);
+        assert!(out.results.is_empty());
+        assert!(
+            out.providers[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("timed out")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
