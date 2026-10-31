@@ -15,10 +15,10 @@ use std::path::PathBuf;
 
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
-    CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Exclusion, ExclusionStage,
-    Filters, Library, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper,
-    PaperEdits, PaxError, ProviderId, SearchOptions, SearchPage, SeedResults, ShowResult,
-    YearRange,
+    CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
+    Exclusion, ExclusionStage, Filters, Library, LibraryIndex, Limit, ListFilter, LogOutcome,
+    Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderId, SearchOptions, SearchPage,
+    SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -474,6 +474,44 @@ pub struct Exported {
     pub text: String,
 }
 
+/// Where one paper's artifact stands, as `pax check` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckState {
+    /// No hash recorded yet (or no `source_url` to check it against); `fetch`
+    /// hasn't run for it.
+    NotFetched,
+    /// The source still resolves to the recorded hash.
+    Reproducible,
+    /// The source now resolves to different content than recorded.
+    Mismatch,
+    /// The source couldn't be resolved (network failure, 404, ...).
+    Error,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PaperCheck {
+    pub citation_key: String,
+    pub status: CheckState,
+    /// The recorded hash, on a mismatch.
+    pub expected: Option<String>,
+    /// The hash the source resolves to now, on a mismatch.
+    pub actual: Option<String>,
+    /// Why the source couldn't be resolved, on an error.
+    pub error: Option<String>,
+}
+
+/// One report per declared paper, then the totals `pax check` prints.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CheckResults {
+    pub papers: Vec<PaperCheck>,
+    pub checked: usize,
+    pub reproducible: usize,
+    pub not_fetched: usize,
+    pub mismatched: usize,
+    pub errored: usize,
+}
+
 /// Serves one research library: `root` is the directory containing
 /// `research/`, as for the `pax` CLI.
 #[derive(Clone)]
@@ -725,6 +763,21 @@ impl PaxServer {
                 .collect(),
             text,
         }))
+    }
+
+    /// Verify every fetched paper's PDF still reproduces from its recorded
+    /// hash (one `nix store prefetch-file` per paper, so it needs the
+    /// network), without writing anything. Papers not fetched yet are
+    /// reported as such; one paper's failure doesn't stop the rest.
+    #[tool]
+    async fn check(&self) -> Result<Json<CheckResults>, String> {
+        self.papers_path()?;
+        let root = self.root.clone();
+        let reports = tokio::task::spawn_blocking(move || pax_core::check_library(&root))
+            .await
+            .map_err(|e| format!("check didn't finish: {e}"))?
+            .map_err(|e| e.to_string())?;
+        Ok(Json(check_results(reports)))
     }
 }
 
@@ -1088,6 +1141,43 @@ fn select_papers(
         .collect())
 }
 
+fn check_results(reports: Vec<CheckReport>) -> CheckResults {
+    let papers: Vec<PaperCheck> = reports
+        .into_iter()
+        .map(|report| {
+            let check = |status| PaperCheck {
+                citation_key: report.citation_key.clone(),
+                status,
+                expected: None,
+                actual: None,
+                error: None,
+            };
+            match report.status {
+                CheckStatus::NotFetched => check(CheckState::NotFetched),
+                CheckStatus::Reproducible => check(CheckState::Reproducible),
+                CheckStatus::Mismatch { expected, actual } => PaperCheck {
+                    expected: Some(expected),
+                    actual: Some(actual),
+                    ..check(CheckState::Mismatch)
+                },
+                CheckStatus::Error(message) => PaperCheck {
+                    error: Some(message),
+                    ..check(CheckState::Error)
+                },
+            }
+        })
+        .collect();
+    let count = |state| papers.iter().filter(|p| p.status == state).count();
+    CheckResults {
+        checked: papers.len(),
+        reproducible: count(CheckState::Reproducible),
+        not_fetched: count(CheckState::NotFetched),
+        mismatched: count(CheckState::Mismatch),
+        errored: count(CheckState::Error),
+        papers,
+    }
+}
+
 fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidate {
     Candidate {
         id: work.id.to_string(),
@@ -1225,6 +1315,7 @@ mod tests {
             names,
             [
                 "add",
+                "check",
                 "cited_by",
                 "edit",
                 "exclude",
@@ -2102,5 +2193,62 @@ mod tests {
         assert!(ris.is_err());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_reports_papers_without_a_source_url_as_not_fetched() {
+        // Neither fixture paper has a `source_url`, so pax-core runs no `nix`
+        // at all, even for turing1936's recorded hash.
+        let root = library_with_two_papers("check");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(checked) = server.check().await.unwrap();
+        let statuses: Vec<_> = checked
+            .papers
+            .iter()
+            .map(|p| (p.citation_key.as_str(), p.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("turing1936", CheckState::NotFetched),
+                ("hewitt1973", CheckState::NotFetched),
+            ]
+        );
+        assert_eq!((checked.checked, checked.not_fetched), (2, 2));
+        assert_eq!(
+            (checked.reproducible, checked.mismatched, checked.errored),
+            (0, 0, 0)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_results_carry_mismatched_hashes_and_errors() {
+        let report = |key: &str, status| CheckReport {
+            citation_key: key.to_string(),
+            status,
+        };
+        let out = check_results(vec![
+            report("a", CheckStatus::Reproducible),
+            report(
+                "b",
+                CheckStatus::Mismatch {
+                    expected: "sha256-old".to_string(),
+                    actual: "sha256-new".to_string(),
+                },
+            ),
+            report("c", CheckStatus::Error("fetch failed: 404".to_string())),
+        ]);
+        assert_eq!(
+            (out.checked, out.reproducible, out.mismatched, out.errored),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(out.papers[1].status, CheckState::Mismatch);
+        assert_eq!(out.papers[1].expected.as_deref(), Some("sha256-old"));
+        assert_eq!(out.papers[1].actual.as_deref(), Some("sha256-new"));
+        assert_eq!(out.papers[2].error.as_deref(), Some("fetch failed: 404"));
+        assert!(out.papers[0].error.is_none() && out.papers[0].expected.is_none());
     }
 }
