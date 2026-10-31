@@ -187,6 +187,23 @@ pub struct ListParams {
     pub tag: Option<String>,
 }
 
+/// The text format `export` renders.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Bibtex,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportParams {
+    pub format: ExportFormat,
+    /// Export only these citation keys; every one must be in the library.
+    /// Without `keys` or `tag`, the whole library is exported.
+    pub keys: Option<Vec<String>>,
+    /// Export only papers with this exact tag (combined with `keys` by AND).
+    pub tag: Option<String>,
+}
+
 /// One provider's record of a paper.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct Candidate {
@@ -446,6 +463,17 @@ pub struct PaperList {
     pub papers: Vec<DeclaredPaper>,
 }
 
+/// Selected papers rendered as text; nothing is written, so the client
+/// decides where it goes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Exported {
+    pub format: ExportFormat,
+    /// The exported papers, in library order.
+    pub citation_keys: Vec<String>,
+    /// Empty when nothing matched.
+    pub text: String,
+}
+
 /// Serves one research library: `root` is the directory containing
 /// `research/`, as for the `pax` CLI.
 #[derive(Clone)]
@@ -670,6 +698,33 @@ impl PaxServer {
             .map(declared)
             .collect();
         Ok(Json(PaperList { papers }))
+    }
+
+    /// Export declared papers as BibTeX text: the whole library, or only the
+    /// given citation `keys` and/or the papers with a `tag`. Returns the text
+    /// instead of writing a file.
+    #[tool]
+    async fn export(
+        &self,
+        Parameters(params): Parameters<ExportParams>,
+    ) -> Result<Json<Exported>, String> {
+        let library = Library::load(&self.papers_path()?).map_err(|e| e.to_string())?;
+        let papers = select_papers(
+            library.papers(),
+            params.keys.as_deref(),
+            params.tag.as_deref(),
+        )?;
+        let text = match params.format {
+            ExportFormat::Bibtex => pax_core::bibtex::render(&papers),
+        };
+        Ok(Json(Exported {
+            format: params.format,
+            citation_keys: papers
+                .iter()
+                .map(|p| p.local.citation_key.clone())
+                .collect(),
+            text,
+        }))
     }
 }
 
@@ -1005,6 +1060,34 @@ fn paper_edits(
     })
 }
 
+/// The papers `export` renders, in library order: those named in `keys`
+/// (when given) that carry `tag` (when given). A key that isn't in the
+/// library is an error rather than silently missing from the export.
+fn select_papers(
+    papers: &[Paper],
+    keys: Option<&[String]>,
+    tag: Option<&str>,
+) -> Result<Vec<Paper>, String> {
+    if let Some(keys) = keys {
+        let unknown: Vec<&str> = keys
+            .iter()
+            .filter(|key| !papers.iter().any(|p| &p.local.citation_key == *key))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!("not in the library: {}", unknown.join(", ")));
+        }
+    }
+    let filter = ListFilter {
+        tag: tag.map(str::to_string),
+        ..ListFilter::default()
+    };
+    Ok(pax_core::filter_papers(papers, &filter)
+        .into_iter()
+        .filter(|p| keys.is_none_or(|keys| keys.contains(&p.local.citation_key)))
+        .collect())
+}
+
 fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidate {
     Candidate {
         id: work.id.to_string(),
@@ -1145,6 +1228,7 @@ mod tests {
                 "cited_by",
                 "edit",
                 "exclude",
+                "export",
                 "list",
                 "refs",
                 "search",
@@ -1946,6 +2030,76 @@ mod tests {
             .expect("an unknown citation key should be refused");
         assert!(unknown.contains("dijkstra1968"), "{unknown}");
         assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn export_of(keys: Option<&[&str]>, tag: Option<&str>) -> Parameters<ExportParams> {
+        Parameters(ExportParams {
+            format: ExportFormat::Bibtex,
+            keys: keys.map(|keys| keys.iter().map(|k| k.to_string()).collect()),
+            tag: tag.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn export_renders_the_library_or_a_selection_as_bibtex() {
+        let root = library_with_two_papers("export");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(all) = server.export(export_of(None, None)).await.unwrap();
+        assert_eq!(all.citation_keys, ["turing1936", "hewitt1973"]);
+        assert!(all.text.contains("@article{turing1936,"), "{}", all.text);
+        assert!(all.text.contains("@article{hewitt1973,"), "{}", all.text);
+        assert!(
+            all.text.contains("doi = {10.1112/plms/s2-42.1.230}"),
+            "{}",
+            all.text
+        );
+
+        let Json(by_key) = server
+            .export(export_of(Some(&["hewitt1973"]), None))
+            .await
+            .unwrap();
+        assert_eq!(by_key.citation_keys, ["hewitt1973"]);
+        assert!(!by_key.text.contains("turing1936"));
+        assert!(
+            by_key
+                .text
+                .contains("title = {A Universal Modular Actor Formalism}")
+        );
+
+        let Json(by_tag) = server
+            .export(export_of(None, Some("computability")))
+            .await
+            .unwrap();
+        assert_eq!(by_tag.citation_keys, ["turing1936"]);
+
+        let Json(none) = server
+            .export(export_of(Some(&["hewitt1973"]), Some("computability")))
+            .await
+            .unwrap();
+        assert!(none.citation_keys.is_empty() && none.text.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_refuses_unknown_keys_and_formats() {
+        let root = library_with_two_papers("export-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let error = server
+            .export(export_of(Some(&["turing1936", "dijkstra1968"]), None))
+            .await
+            .err()
+            .expect("an unknown key should be refused");
+        assert!(
+            error.contains("dijkstra1968") && !error.contains("turing1936"),
+            "{error}"
+        );
+
+        let ris = serde_json::from_value::<ExportParams>(serde_json::json!({ "format": "ris" }));
+        assert!(ris.is_err());
 
         fs::remove_dir_all(root).unwrap();
     }
