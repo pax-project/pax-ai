@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Exclusion, ExclusionStage,
-    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaxError,
-    ProviderId, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
+    Filters, Library, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper,
+    PaperEdits, PaxError, ProviderId, SearchOptions, SearchPage, SeedResults, ShowResult,
+    YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -159,6 +160,21 @@ pub struct UnexcludeParams {
     /// The exclusion's key (as `exclude` returns it, or as `add`'s refusal
     /// names it), a DOI, or a provider reference from `search`.
     pub reference: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct EditParams {
+    /// The citation key of a paper in the library.
+    pub reference: String,
+    /// Tags to add; one the paper already has isn't repeated.
+    #[serde(default)]
+    pub add_tags: Vec<String>,
+    /// Tags to remove, applied after `add_tags` (so a tag in both ends up
+    /// removed).
+    #[serde(default)]
+    pub remove_tags: Vec<String>,
+    /// Replaces the paper's notes.
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -604,6 +620,23 @@ impl PaxServer {
         Ok(Json(excluded(exclusion)))
     }
 
+    /// Edit a declared paper's tags and notes (e.g. tag it with a review's
+    /// screening decision). Returns the paper as it is after the edit.
+    #[tool]
+    async fn edit(
+        &self,
+        Parameters(params): Parameters<EditParams>,
+    ) -> Result<Json<DeclaredPaper>, String> {
+        let path = self.papers_path()?;
+        let edits = paper_edits(params.add_tags, params.remove_tags, params.notes)?;
+        pax_core::edit_paper(&params.reference, &self.root, &edits).map_err(|e| e.to_string())?;
+        let library = Library::load(&path).map_err(|e| e.to_string())?;
+        let paper = library
+            .find(&params.reference)
+            .ok_or_else(|| format!("{:?} disappeared after the edit", params.reference))?;
+        Ok(Json(declared(paper)))
+    }
+
     /// The review's PRISMA 2020 flow-diagram counts: records identified per
     /// provider (database searches and citation searching), duplicates
     /// removed, records screened, exclusions at each stage (full-text ones
@@ -613,12 +646,7 @@ impl PaxServer {
     /// not as passed. Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
-        if !pax_core::nix::papers_path(&self.root).exists() {
-            return Err(format!(
-                "no pax library at {} (research/papers.nix not found)",
-                self.root.display()
-            ));
-        }
+        self.papers_path()?;
         let stats = pax_core::stats(&self.root).map_err(|e| e.to_string())?;
         Ok(Json(prisma_stats(stats)))
     }
@@ -646,8 +674,21 @@ impl PaxServer {
 }
 
 impl PaxServer {
-    /// A logged search's results, flagged against the library as it is
-    /// now.
+    /// The library's `research/papers.nix`, or a clear error when the root
+    /// has none.
+    fn papers_path(&self) -> Result<PathBuf, String> {
+        let path = pax_core::nix::papers_path(&self.root);
+        if !path.exists() {
+            return Err(format!(
+                "no pax library at {} (research/papers.nix not found)",
+                self.root.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    /// A logged search's or citation lookup's results, flagged against the
+    /// library as it is now.
     fn results<E: Display>(
         &self,
         logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
@@ -937,6 +978,33 @@ fn excluded(exclusion: Exclusion) -> Excluded {
     }
 }
 
+/// The tag and notes edits `edit` asks for. Blank tags are refused, since
+/// they'd be written into `papers.nix` as empty strings, and so is an edit
+/// with nothing in it (pax-core's own message for that names the CLI's
+/// flags).
+fn paper_edits(
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+    notes: Option<String>,
+) -> Result<PaperEdits, String> {
+    if add_tags
+        .iter()
+        .chain(&remove_tags)
+        .any(|tag| tag.trim().is_empty())
+    {
+        return Err("tags must not be blank".to_string());
+    }
+    if add_tags.is_empty() && remove_tags.is_empty() && notes.is_none() {
+        return Err("nothing to edit: give `add_tags`, `remove_tags`, and/or `notes`".to_string());
+    }
+    Ok(PaperEdits {
+        add_tags,
+        remove_tags,
+        notes,
+        ..PaperEdits::default()
+    })
+}
+
 fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidate {
     Candidate {
         id: work.id.to_string(),
@@ -1000,7 +1068,7 @@ fn declared(paper: &Paper) -> DeclaredPaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pax_core::{Exclusions, Library, ProviderError};
+    use pax_core::{Exclusion, Exclusions, Library, ProviderError};
     use std::fs;
 
     fn library_with_two_papers(name: &str) -> PathBuf {
@@ -1075,6 +1143,7 @@ mod tests {
             [
                 "add",
                 "cited_by",
+                "edit",
                 "exclude",
                 "list",
                 "refs",
@@ -1802,5 +1871,82 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    fn edit_of(reference: &str) -> EditParams {
+        EditParams {
+            reference: reference.to_string(),
+            ..EditParams::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_round_trips_tags_and_notes_through_papers_nix() {
+        let root = library_with_two_papers("edit");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(edited) = server
+            .edit(Parameters(EditParams {
+                add_tags: vec!["review-1".to_string(), "computability".to_string()],
+                remove_tags: vec!["concurrency".to_string()],
+                notes: Some("included: meets criterion C2".to_string()),
+                ..edit_of("hewitt1973")
+            }))
+            .await
+            .unwrap();
+        assert_eq!(edited.tags, ["review-1", "computability"]);
+        assert_eq!(
+            edited.notes.as_deref(),
+            Some("included: meets criterion C2")
+        );
+
+        let library = Library::load(&pax_core::nix::papers_path(&root)).unwrap();
+        let reloaded = declared(library.find("hewitt1973").unwrap());
+        assert_eq!(reloaded.tags, edited.tags);
+        assert_eq!(reloaded.notes, edited.notes);
+        let Json(tagged) = server
+            .list(Parameters(ListParams {
+                tag: Some("review-1".to_string()),
+                ..ListParams::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(tagged.papers.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_an_empty_edit_blank_tags_and_unknown_keys() {
+        let root = library_with_two_papers("edit-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let empty = server
+            .edit(Parameters(edit_of("hewitt1973")))
+            .await
+            .err()
+            .expect("an empty edit should be refused");
+        assert!(empty.contains("add_tags"), "{empty}");
+        let blank = server
+            .edit(Parameters(EditParams {
+                add_tags: vec![" ".to_string()],
+                ..edit_of("hewitt1973")
+            }))
+            .await;
+        assert!(blank.is_err());
+        let unknown = server
+            .edit(Parameters(EditParams {
+                notes: Some("n".to_string()),
+                ..edit_of("dijkstra1968")
+            }))
+            .await
+            .err()
+            .expect("an unknown citation key should be refused");
+        assert!(unknown.contains("dijkstra1968"), "{unknown}");
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
