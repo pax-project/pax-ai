@@ -960,13 +960,17 @@ impl ServerHandler for PaxServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("pax-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Tools over a pax research library: search providers for papers, \
-                 follow papers' references and citations, show one, add it to \
-                 the library or exclude it with a reason (and reverse an \
-                 exclusion the reviewer reconsiders), list what's declared, \
-                 and report PRISMA flow counts. Writes go to research/ \
-                 through pax-core, and searches are recorded in \
-                 research/search-log.jsonl.",
+                "Tools over a pax research library: search providers for papers \
+                 (search), follow papers' references and citations (refs, \
+                 cited_by), show one by reference, citation key, or DOI (show), \
+                 add it to the library (add) or exclude it with a reason \
+                 (exclude, and unexclude to reverse an exclusion the reviewer \
+                 reconsiders), tag and annotate declared papers (edit), fetch a \
+                 paper's PDF through Nix (fetch, which can take minutes), verify \
+                 fetched PDFs still reproduce (check), list what's declared \
+                 (list), export it as BibTeX text (export), and report PRISMA \
+                 flow counts (stats). Writes go to research/ through pax-core, \
+                 and searches are recorded in research/search-log.jsonl.",
             )
     }
 }
