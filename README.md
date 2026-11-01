@@ -19,6 +19,7 @@ Early: the LLM port with Anthropic and Ollama adapters, cached summaries, and a 
 - `show`: one paper, by provider reference or citation key.
 - `add`: declare a search result in `research/papers.nix`. A paper already in the library is refused.
 - `exclude`: record a paper in `research/excluded.nix` with a required `reason` and a `stage` (`screening` or `full-text`), and an optional `title`.
+- `unexclude`: reverse a recorded screening decision, removing the paper's entry from `research/excluded.nix` by its exclusion key, DOI, or provider reference.
 - `list`: declared papers, filtered by author, year, and tag.
 - `stats`: the review's PRISMA 2020 flow-diagram counts (records identified per provider, duplicates removed, records screened, exclusions per stage with full-text reasons, papers awaiting a screening decision, reports sought, reports not retrieved, papers included, and decisions made outside the search log), computed by pax-core from the library's files.
 
