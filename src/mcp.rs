@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Exclusion, ExclusionStage,
-    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, Paper, PaxError, ProviderId,
-    SearchOptions, SearchPage, ShowResult, YearRange,
+    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaxError,
+    ProviderId, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -91,11 +91,28 @@ pub struct SearchParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CitationParams {
-    /// The seed paper: a provider reference (e.g. `openalex:W2072794470`, from
-    /// any provider) or the citation key of a paper in the library.
-    pub reference: String,
+    /// One seed paper: a provider reference (e.g. `openalex:W2072794470`,
+    /// from any provider) or the citation key of a paper in the library.
+    /// Give exactly one of `reference` or `references`.
+    pub reference: Option<String>,
+    /// Several seed papers, each as `reference`, for one snowballing round:
+    /// each seed is reported on its own, and the results are merged across
+    /// every seed.
+    pub references: Option<Vec<String>>,
     #[serde(flatten)]
     pub paging: PagingParams,
+}
+
+impl CitationParams {
+    /// The seeds to look up, in the order given.
+    fn seeds(self) -> Result<Vec<String>, String> {
+        match (self.reference, self.references) {
+            (Some(reference), None) => Ok(vec![reference]),
+            (None, Some(references)) if !references.is_empty() => Ok(references),
+            (None, Some(_)) => Err("`references` must name at least one seed".to_string()),
+            _ => Err("give exactly one of `reference` or `references`".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -259,6 +276,57 @@ pub struct SearchResults {
     pub log: SearchLogStatus,
 }
 
+/// One provider whose citation list for a seed is incomplete, and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct IncompleteList {
+    pub provider: String,
+    /// `withheld` (the provider holds the list back, e.g. at the publisher's
+    /// request), `failed` (the request failed), `unresolved` (the provider
+    /// can't look the seed up, or has no record of it), or `truncated`
+    /// (`limit` stopped retrieval before the provider's total; the list is
+    /// good, just short).
+    pub reason: String,
+}
+
+/// One seed's part in a `refs` or `cited_by` lookup.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SeedReport {
+    /// The seed as given.
+    pub seed: String,
+    /// An earlier seed that is the same paper, whose lists these are.
+    pub same_as: Option<String>,
+    /// What each citation provider returned for this seed.
+    pub providers: Vec<ProviderReport>,
+    /// This seed's provider lists that are incomplete, with why.
+    pub incomplete: Vec<IncompleteList>,
+    /// Whether every provider returned this seed's whole list.
+    pub complete: bool,
+    /// Set when the seed itself is invalid (a malformed reference, or a
+    /// citation key not in the library); no provider was asked for it, and
+    /// the other seeds still answer.
+    pub error: Option<String>,
+}
+
+/// One paper in a list merged across seeds and providers.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CitationHit {
+    #[serde(flatten)]
+    pub hit: MergedHit,
+    /// The seeds whose lists returned this paper, as given, in seed order.
+    pub seeds: Vec<String>,
+}
+
+/// Per-seed reports and one list merged across every seed and provider.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CitationResults {
+    pub seeds: Vec<SeedReport>,
+    /// Whether every seed's lists are complete.
+    pub complete: bool,
+    pub merge: MergeCounts,
+    pub results: Vec<CitationHit>,
+    pub log: SearchLogStatus,
+}
+
 /// A paper declared in the library.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DeclaredPaper {
@@ -406,35 +474,43 @@ impl PaxServer {
         Ok(Json(self.results(logged, &PROVIDER_ORDER)))
     }
 
-    /// The papers a seed paper cites, from OpenAlex and Semantic Scholar (the
-    /// providers with real citation data), in the same shape as `search`:
-    /// per-provider counts, then one merged list flagged against the
-    /// library. Recorded in the library's search log.
+    /// The papers one or more seed papers cite (backward snowballing), from
+    /// OpenAlex and Semantic Scholar (the providers with real citation
+    /// data). Reports each seed on its own: per-provider counts and which
+    /// lists are `incomplete`, with why; then one list merged across every
+    /// seed and provider, each paper naming the `seeds` and `providers` that
+    /// returned it and flagged against the library. `complete` says whether
+    /// every seed's lists are whole. When a seed's list is `withheld`,
+    /// `failed`, or `unresolved` for a provider, that list is missing: take
+    /// the paper's references from its own reference list (its
+    /// bibliography) instead. `truncated` only means `limit` stopped
+    /// retrieval; ask again with a higher `limit` or `all`. Recorded in the
+    /// library's search log.
     #[tool]
     async fn refs(
         &self,
         Parameters(params): Parameters<CitationParams>,
-    ) -> Result<Json<SearchResults>, String> {
+    ) -> Result<Json<CitationResults>, String> {
         let options = params.paging.options()?;
+        let seeds = params.seeds()?;
         let logged =
-            pax_core::references_logged(&params.reference, &options, &self.root, &self.config)
-                .await
-                .map_err(|e| e.to_string())?;
-        Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
+            pax_core::references_many_logged(&seeds, &options, &self.root, &self.config).await;
+        self.citations(logged).map(Json)
     }
 
-    /// The papers citing a seed paper; otherwise as `refs`.
+    /// The papers citing one or more seed papers (forward snowballing);
+    /// otherwise as `refs`. A paper's own text can't list what cites it, so
+    /// a missing list here has no fallback but the other provider's.
     #[tool]
     async fn cited_by(
         &self,
         Parameters(params): Parameters<CitationParams>,
-    ) -> Result<Json<SearchResults>, String> {
+    ) -> Result<Json<CitationResults>, String> {
         let options = params.paging.options()?;
+        let seeds = params.seeds()?;
         let logged =
-            pax_core::cited_by_logged(&params.reference, &options, &self.root, &self.config)
-                .await
-                .map_err(|e| e.to_string())?;
-        Ok(Json(self.results(logged, &CITATION_PROVIDERS)))
+            pax_core::cited_by_many_logged(&seeds, &options, &self.root, &self.config).await;
+        self.citations(logged).map(Json)
     }
 
     /// Show one paper: a provider reference from `search` (resolved live), or
@@ -570,8 +646,8 @@ impl PaxServer {
 }
 
 impl PaxServer {
-    /// A logged search's or citation lookup's results, flagged against the
-    /// library as it is now.
+    /// A logged search's results, flagged against the library as it is
+    /// now.
     fn results<E: Display>(
         &self,
         logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
@@ -580,6 +656,23 @@ impl PaxServer {
         let Logged { results, log, .. } = logged;
         let index = LibraryIndex::load(&self.root);
         search_results(&results, providers, &index, log)
+    }
+
+    /// A logged multi-seed citation lookup's results, flagged against the
+    /// library as it is now. When no seed was valid, no provider was asked
+    /// and nothing was logged, so it's an error naming each seed's problem.
+    fn citations(&self, logged: Logged<SeedResults>) -> Result<CitationResults, String> {
+        let Logged { results, log, .. } = logged;
+        let invalid: Vec<String> = results
+            .seeds
+            .iter()
+            .filter_map(|seed| seed.results.as_ref().err().map(ToString::to_string))
+            .collect();
+        if invalid.len() == results.seeds.len() {
+            return Err(invalid.join("; "));
+        }
+        let index = LibraryIndex::load(&self.root);
+        Ok(citation_results(&results, &index, log))
     }
 }
 
@@ -590,7 +683,7 @@ impl ServerHandler for PaxServer {
             .with_server_info(Implementation::new("pax-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Tools over a pax research library: search providers for papers, \
-                 follow a paper's references and citations, show one, add it to \
+                 follow papers' references and citations, show one, add it to \
                  the library or exclude it with a reason (and reverse an \
                  exclusion the reviewer reconsiders), list what's declared, \
                  and report PRISMA flow counts. Writes go to research/ \
@@ -622,16 +715,7 @@ fn search_results<E: Display>(
     let hits = merged
         .works
         .iter()
-        .map(|merged| MergedHit {
-            work: candidate(
-                &merged.work,
-                merged.records().any(|work| index.contains(work)),
-                merged.records().any(|work| index.is_excluded(work)),
-            ),
-            providers: merged.providers().iter().map(ToString::to_string).collect(),
-            ids: merged.ids().iter().map(ToString::to_string).collect(),
-            language_unknown: merged.records().all(language_unknown),
-        })
+        .map(|merged| merged_hit(merged, index, &language_unknown))
         .collect();
     SearchResults {
         providers: reports,
@@ -643,6 +727,122 @@ fn search_results<E: Display>(
         },
         results: hits,
         log: log_status(log),
+    }
+}
+
+/// Each seed's report, and pax-core's list merged across every seed and
+/// provider, flagged against `index`.
+fn citation_results(
+    results: &SeedResults,
+    index: &LibraryIndex,
+    log: LogOutcome,
+) -> CitationResults {
+    let seed_name = |i: usize| results.seeds[i].seed.clone();
+    let seeds: Vec<SeedReport> = results
+        .seeds
+        .iter()
+        .map(|seed| {
+            seed_report(
+                &seed.seed,
+                seed.same_as.map(seed_name),
+                seed.results.as_ref(),
+            )
+        })
+        .collect();
+    let language_unknown = |work: &CandidateWork| {
+        results
+            .seeds
+            .iter()
+            .filter_map(|seed| seed.results.as_ref().ok())
+            .flat_map(|lists| lists.values().flatten())
+            .any(|page| page.is_language_unknown(work))
+    };
+    let merged = results.merge();
+    let hits = merged
+        .works
+        .iter()
+        .map(|work| {
+            let mut seeds: Vec<String> = Vec::new();
+            for name in work.seeds().into_iter().map(seed_name) {
+                if !seeds.contains(&name) {
+                    seeds.push(name);
+                }
+            }
+            CitationHit {
+                hit: merged_hit(&work.merged, index, &language_unknown),
+                seeds,
+            }
+        })
+        .collect();
+    CitationResults {
+        complete: seeds.iter().all(|seed| seed.complete),
+        seeds,
+        merge: MergeCounts {
+            before: merged.before,
+            after: merged.after,
+            duplicates: merged.duplicates(),
+            unmatched: merged.unmatched,
+        },
+        results: hits,
+        log: log_status(log),
+    }
+}
+
+/// One seed's per-provider reports and incomplete lists, or why the seed is
+/// invalid.
+fn seed_report(
+    seed: &str,
+    same_as: Option<String>,
+    results: Result<&pax_core::CitationResults, &PaxError>,
+) -> SeedReport {
+    match results {
+        Ok(lists) => {
+            let incomplete: Vec<IncompleteList> = pax_core::incomplete_lists(lists)
+                .into_iter()
+                .map(|list| IncompleteList {
+                    provider: list.provider.to_string(),
+                    reason: list.reason.to_string(),
+                })
+                .collect();
+            SeedReport {
+                seed: seed.to_string(),
+                same_as,
+                providers: CITATION_PROVIDERS
+                    .iter()
+                    .filter_map(|provider| Some(provider_report(*provider, lists.get(provider)?)))
+                    .collect(),
+                complete: incomplete.is_empty(),
+                incomplete,
+                error: None,
+            }
+        }
+        Err(e) => SeedReport {
+            seed: seed.to_string(),
+            same_as,
+            providers: Vec::new(),
+            incomplete: Vec::new(),
+            complete: false,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+/// One merged paper, flagged against `index`; `language_unknown` tells
+/// whether a language filter kept a record without a language to check.
+fn merged_hit(
+    merged: &MergedWork,
+    index: &LibraryIndex,
+    language_unknown: &impl Fn(&CandidateWork) -> bool,
+) -> MergedHit {
+    MergedHit {
+        work: candidate(
+            &merged.work,
+            merged.records().any(|work| index.contains(work)),
+            merged.records().any(|work| index.is_excluded(work)),
+        ),
+        providers: merged.providers().iter().map(ToString::to_string).collect(),
+        ids: merged.ids().iter().map(ToString::to_string).collect(),
+        language_unknown: merged.records().all(language_unknown),
     }
 }
 
@@ -1174,13 +1374,20 @@ mod tests {
         assert!(status.reason.unwrap().contains("disk full"));
     }
 
+    fn seeds(references: &[&str]) -> Parameters<CitationParams> {
+        Parameters(CitationParams {
+            references: Some(references.iter().map(|r| r.to_string()).collect()),
+            ..CitationParams::default()
+        })
+    }
+
     #[tokio::test]
-    async fn refs_and_cited_by_refuse_an_invalid_seed_without_logging_it() {
+    async fn refs_and_cited_by_refuse_only_invalid_seeds_without_logging_them() {
         let root = library_with_two_papers("citations");
         let server = PaxServer::new(root.clone(), Config::default());
         let seed = |reference: &str| {
             Parameters(CitationParams {
-                reference: reference.to_string(),
+                reference: Some(reference.to_string()),
                 ..CitationParams::default()
             })
         };
@@ -1191,15 +1398,121 @@ mod tests {
             .err()
             .expect("an unknown citation key should be refused");
         assert!(unknown_key.contains("dijkstra1968"), "{unknown_key}");
-        let bad_reference = server
-            .cited_by(seed("nowhere:123"))
+        let bad_references = server
+            .cited_by(seeds(&["nowhere:123", "dijkstra1968"]))
             .await
             .err()
-            .expect("an unknown provider should be refused");
-        assert!(bad_reference.contains("nowhere"), "{bad_reference}");
+            .expect("a call with no valid seed should be refused");
+        assert!(bad_references.contains("nowhere"), "{bad_references}");
+        assert!(bad_references.contains("dijkstra1968"), "{bad_references}");
         assert!(!root.join("research/search-log.jsonl").exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_seed_is_reported_on_that_seed_while_the_others_answer() {
+        let root = library_with_two_papers("citations-unresolvable");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        // hewitt1973 has no DOI or arXiv id, so neither provider can look it
+        // up and no request is made; dijkstra1968 isn't in the library.
+        let Json(out) = server
+            .refs(seeds(&["hewitt1973", "dijkstra1968", "hewitt1973"]))
+            .await
+            .unwrap();
+
+        let hewitt = &out.seeds[0];
+        assert_eq!(hewitt.seed, "hewitt1973");
+        assert!(hewitt.error.is_none() && !hewitt.complete);
+        let incomplete: Vec<_> = hewitt
+            .incomplete
+            .iter()
+            .map(|list| (list.provider.as_str(), list.reason.as_str()))
+            .collect();
+        assert_eq!(
+            incomplete,
+            [
+                ("openalex", "unresolved"),
+                ("semanticscholar", "unresolved")
+            ]
+        );
+        assert_eq!(hewitt.providers.len(), 2);
+
+        let dijkstra = &out.seeds[1];
+        assert!(dijkstra.error.as_deref().unwrap().contains("dijkstra1968"));
+        assert!(dijkstra.providers.is_empty() && !dijkstra.complete);
+
+        assert_eq!(out.seeds[2].same_as.as_deref(), Some("hewitt1973"));
+        assert!(!out.complete);
+        assert!(out.results.is_empty());
+        assert!(out.log.logged, "the valid seeds' lookups are logged");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_withheld_list_is_reported_on_its_seed() {
+        use pax_core::CitationError;
+
+        let page = SearchPage::new(
+            vec![work(ProviderId::OpenAlex, "W1", "A", Some("10.1000/a"))],
+            Some(1),
+            None,
+        );
+        let lists: pax_core::CitationResults = HashMap::from([
+            (ProviderId::OpenAlex, Ok(page)),
+            (
+                ProviderId::SemanticScholar,
+                Err(CitationError::Provider(ProviderError::Withheld {
+                    message: "references withheld by the publisher".to_string(),
+                })),
+            ),
+        ]);
+
+        let report = seed_report("openalex:W9", None, Ok(&lists));
+
+        assert!(!report.complete);
+        assert_eq!(report.incomplete.len(), 1);
+        assert_eq!(report.incomplete[0].reason, "withheld");
+        assert_eq!(
+            report.incomplete[0].provider,
+            ProviderId::SemanticScholar.to_string()
+        );
+        let semantic_scholar = &report.providers[1];
+        assert!(
+            semantic_scholar
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("withheld")
+        );
+        assert!(report.providers[0].complete && report.providers[0].error.is_none());
+    }
+
+    #[test]
+    fn citation_params_take_one_seed_or_several() {
+        let params = |value: serde_json::Value| {
+            serde_json::from_value::<CitationParams>(value)
+                .unwrap()
+                .seeds()
+        };
+        assert_eq!(
+            params(serde_json::json!({ "reference": "openalex:W1" })).unwrap(),
+            ["openalex:W1"]
+        );
+        assert_eq!(
+            params(serde_json::json!({ "references": ["openalex:W1", "turing1936"], "limit": 5 }))
+                .unwrap(),
+            ["openalex:W1", "turing1936"]
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({ "references": [] }),
+            serde_json::json!({ "reference": "openalex:W1", "references": ["openalex:W2"] }),
+        ] {
+            assert!(params(invalid.clone()).is_err(), "{invalid}");
+        }
     }
 
     #[tokio::test]
@@ -1207,11 +1520,12 @@ mod tests {
         let server = PaxServer::new(PathBuf::from("."), Config::default());
         let params = || {
             Parameters(CitationParams {
-                reference: "openalex:W2072794470".to_string(),
+                reference: Some("openalex:W2072794470".to_string()),
                 paging: PagingParams {
                     doc_type: Some("blog-post".to_string()),
                     ..PagingParams::default()
                 },
+                ..CitationParams::default()
             })
         };
         assert!(server.refs(params()).await.is_err());
