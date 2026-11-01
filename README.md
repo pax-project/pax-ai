@@ -17,8 +17,9 @@ Early: the LLM port with Anthropic and Ollama adapters, cached summaries, and a 
 - `search`: by `query` or `author`, with `limit` (default 50 per provider) or `all`, and `year` (`2020`, `2015-2020`, `2015-`, `-2020`), `type`, and `language` filters. Returns each provider's `retrieved`/`total` counts and how it applied each filter, the merge counts, and one list merged across providers: each paper with the providers and references it came from, flagged `in_library`, `excluded`, and `language_unknown`.
 - `refs`, `cited_by`: a seed paper's references or citing papers, from OpenAlex and Semantic Scholar. The seed is a provider reference or a library citation key; paging, filters, and result shape are `search`'s.
 - `show`: one paper, by provider reference or citation key.
-- `add`: declare a search result in `research/papers.nix`. A paper already in the library is refused.
+- `add`: declare a search result in `research/papers.nix`. A paper already in the library is refused, and so is an excluded one: the refusal names its exclusion (stage, reason, key) and says to call `unexclude` first.
 - `exclude`: record a paper in `research/excluded.nix` with a required `reason` and a `stage` (`screening` or `full-text`), and an optional `title`.
+- `unexclude`: reverse a recorded screening decision, removing the paper's entry from `research/excluded.nix` by its exclusion key, DOI, or provider reference.
 - `list`: declared papers, filtered by author, year, and tag.
 - `stats`: the review's PRISMA 2020 flow-diagram counts (records identified per provider, duplicates removed, records screened, exclusions per stage with full-text reasons, papers awaiting a screening decision, reports sought, reports not retrieved, papers included, and decisions made outside the search log), computed by pax-core from the library's files.
 
