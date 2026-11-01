@@ -468,7 +468,9 @@ impl PaxServer {
 
     /// Declare a search result in the library (metadata only; the PDF is
     /// fetched separately). Returns the new paper's citation key. A paper
-    /// already in the library (same DOI or arXiv id) is refused.
+    /// already in the library (same DOI or arXiv id) is refused, and so is
+    /// one excluded from the review: the refusal names its exclusion, which
+    /// only `unexclude` reverses, so ask the reviewer before calling it.
     #[tool]
     async fn add(
         &self,
@@ -703,15 +705,25 @@ fn log_status(log: LogOutcome) -> SearchLogStatus {
     }
 }
 
-/// Why `add` failed; a paper already in the library says so plainly, since
-/// an agent is expected to retry with another result rather than treat it
-/// as a failure.
+/// Why `add` failed; a paper already in the library or excluded from the
+/// review says so plainly, since an agent is expected to move on to another
+/// result (or, for an exclusion, ask the reviewer) rather than treat it as a
+/// failure.
 fn add_error(e: PaxError) -> String {
     match e {
         PaxError::AlreadyDeclared {
             reference,
             citation_key,
         } => format!("not added: {reference} is already in the library as {citation_key:?}"),
+        PaxError::AlreadyExcluded {
+            reference,
+            key,
+            stage,
+            reason,
+        } => format!(
+            "not added: {reference} was excluded at {stage} ({reason:?}); call unexclude \
+             with {key:?} first to reverse that decision"
+        ),
         other => other.to_string(),
     }
 }
@@ -1428,6 +1440,41 @@ mod tests {
             .expect("a declared paper should be refused");
         assert!(error.contains("already in the library"), "{error}");
         assert!(error.contains("turing1936"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_excluded_paper_and_points_to_unexclude() {
+        let root = library_with_two_papers("add-excluded");
+        let server = PaxServer::new(root.clone(), Config::default());
+        server
+            .exclude(exclusion(
+                "10.1000/essay",
+                "not empirical",
+                Some("An Essay"),
+            ))
+            .await
+            .unwrap();
+        // As above, the Crossref reference's DOI matches the exclusion before
+        // anything is resolved.
+        let error = server
+            .add(Parameters(ReferenceParams {
+                reference: "crossref:10.1000/essay".to_string(),
+            }))
+            .await
+            .err()
+            .expect("an excluded paper should be refused");
+        assert_eq!(
+            error,
+            "not added: crossref:10.1000/essay was excluded at full-text (\"not empirical\"); \
+             call unexclude with \"10.1000/essay\" first to reverse that decision"
+        );
+        let Json(listed) = server
+            .list(Parameters(ListParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(listed.papers.len(), 2, "nothing was declared");
 
         fs::remove_dir_all(root).unwrap();
     }
