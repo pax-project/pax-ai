@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Exclusion, ExclusionStage,
-    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, Paper, PaxError, ProviderId,
-    SearchOptions, SearchPage, ShowResult, YearRange,
+    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaxError,
+    ProviderId, SearchOptions, SearchPage, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -622,16 +622,7 @@ fn search_results<E: Display>(
     let hits = merged
         .works
         .iter()
-        .map(|merged| MergedHit {
-            work: candidate(
-                &merged.work,
-                merged.records().any(|work| index.contains(work)),
-                merged.records().any(|work| index.is_excluded(work)),
-            ),
-            providers: merged.providers().iter().map(ToString::to_string).collect(),
-            ids: merged.ids().iter().map(ToString::to_string).collect(),
-            language_unknown: merged.records().all(language_unknown),
-        })
+        .map(|merged| merged_hit(merged, index, &language_unknown))
         .collect();
     SearchResults {
         providers: reports,
@@ -643,6 +634,25 @@ fn search_results<E: Display>(
         },
         results: hits,
         log: log_status(log),
+    }
+}
+
+/// One merged paper, flagged against `index`; `language_unknown` tells
+/// whether a language filter kept a record without a language to check.
+fn merged_hit(
+    merged: &MergedWork,
+    index: &LibraryIndex,
+    language_unknown: &impl Fn(&CandidateWork) -> bool,
+) -> MergedHit {
+    MergedHit {
+        work: candidate(
+            &merged.work,
+            merged.records().any(|work| index.contains(work)),
+            merged.records().any(|work| index.is_excluded(work)),
+        ),
+        providers: merged.providers().iter().map(ToString::to_string).collect(),
+        ids: merged.ids().iter().map(ToString::to_string).collect(),
+        language_unknown: merged.records().all(language_unknown),
     }
 }
 
