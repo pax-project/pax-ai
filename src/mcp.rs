@@ -303,7 +303,12 @@ pub struct PrismaStats {
     pub records_screened: usize,
     /// Papers excluded at title/abstract screening.
     pub excluded_screening: usize,
-    /// `records_screened - excluded_screening`.
+    /// Distinct logged papers with no screening decision yet: neither
+    /// excluded nor declared. Report these as still to screen, not as
+    /// passed.
+    pub awaiting_screening: usize,
+    /// Papers that passed screening: declared papers plus papers excluded at
+    /// full text.
     pub reports_sought: usize,
     /// Declared papers with no fetchable artifact (no `source_url` or no
     /// `hash`).
@@ -315,6 +320,11 @@ pub struct PrismaStats {
     pub included: usize,
     /// Search-log lines whose provider failed; they count nowhere else.
     pub skipped_log_lines: usize,
+    /// Declared or excluded papers that match no logged record (e.g. added
+    /// from a DOI the reviewer already knew); still counted in their box.
+    /// When 0, `records_screened = excluded_screening + reports_sought +
+    /// awaiting_screening`.
+    pub decided_outside_log: usize,
 }
 
 /// Records identified, per provider tag (e.g. `openalex`).
@@ -500,8 +510,10 @@ impl PaxServer {
     /// The review's PRISMA 2020 flow-diagram counts: records identified per
     /// provider (database searches and citation searching), duplicates
     /// removed, records screened, exclusions at each stage (full-text ones
-    /// by reason), reports not retrieved, and papers included. Computed from
-    /// the library's files; nothing is written.
+    /// by reason), papers still awaiting a screening decision, reports sought
+    /// (papers that passed screening), reports not retrieved, and papers
+    /// included. Mid-round, report `awaiting_screening` as still to screen,
+    /// not as passed. Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
         if !pax_core::nix::papers_path(&self.root).exists() {
@@ -708,6 +720,7 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         duplicates_removed: stats.duplicates_removed,
         records_screened: stats.records_screened,
         excluded_screening: stats.excluded_screening,
+        awaiting_screening: stats.awaiting_screening,
         reports_sought: stats.reports_sought,
         not_retrieved: stats.not_retrieved,
         reports_assessed: stats.reports_assessed,
@@ -725,6 +738,7 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         },
         included: stats.included,
         skipped_log_lines: stats.skipped_log_lines,
+        decided_outside_log: stats.decided_outside_log,
     }
 }
 
@@ -1265,8 +1279,14 @@ mod tests {
                     "An Essay",
                     Some("10.1000/essay"),
                 ),
+                work(
+                    ProviderId::OpenAlex,
+                    "W3",
+                    "Undecided",
+                    Some("10.1000/undecided"),
+                ),
             ],
-            Some(2),
+            Some(3),
             None,
         );
         let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> =
@@ -1289,10 +1309,16 @@ mod tests {
             .unwrap();
 
         let Json(stats) = server.stats().await.unwrap();
-        assert_eq!(stats.identified.databases.get("openalex"), Some(&2));
-        assert_eq!(stats.identified.total, 2);
-        assert_eq!(stats.records_screened, 2);
+        assert_eq!(stats.identified.databases.get("openalex"), Some(&3));
+        assert_eq!(stats.identified.total, 3);
+        assert_eq!(stats.records_screened, 3);
         assert_eq!(stats.duplicates_removed, 0);
+        // The undecided paper awaits screening rather than counting as
+        // passed: only the declared papers and the full-text exclusion did.
+        assert_eq!(stats.awaiting_screening, 1);
+        assert_eq!(stats.reports_sought, 3);
+        // hewitt1973 was declared without a logged search finding it.
+        assert_eq!(stats.decided_outside_log, 1);
         assert_eq!(stats.excluded_full_text.total, 1);
         assert_eq!(stats.excluded_full_text.reasons[0].reason, "not empirical");
         assert_eq!(stats.excluded_full_text.reasons[0].count, 1);
