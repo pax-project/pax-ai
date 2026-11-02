@@ -840,9 +840,9 @@ impl PaxServer {
     /// The review's PRISMA 2020 flow-diagram counts: records identified per
     /// provider (database searches and citation searching), duplicates
     /// removed, records screened, exclusions at each stage (full-text ones
-    /// by reason, both stages by criterion), papers still awaiting a screening decision, reports sought
-    /// (papers that passed screening), reports not retrieved, and papers
-    /// included. Mid-round, report `awaiting_screening` as still to screen,
+    /// by reason, both stages by criterion), papers still awaiting a
+    /// screening decision, reports sought (papers that passed screening),
+    /// reports not retrieved, and papers included. Mid-round, report `awaiting_screening` as still to screen,
     /// not as passed. Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
