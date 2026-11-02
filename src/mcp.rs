@@ -371,11 +371,12 @@ pub struct IncompleteList {
     /// request), `failed` (the request failed), `unresolved` (the provider
     /// can't look the seed up, or has no record of it), or `truncated`
     /// (`limit` stopped retrieval before the provider's total; the list is
-    /// good, just short).
+    /// good, just short). `related` reports only the missing lists
+    /// (`failed`, `unresolved`), since its lists have no total.
     pub reason: String,
 }
 
-/// One seed's part in a `refs` or `cited_by` lookup.
+/// One seed's part in a `refs`, `cited_by` or `related` lookup.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SeedReport {
     /// The seed as given.
@@ -386,7 +387,8 @@ pub struct SeedReport {
     pub providers: Vec<ProviderReport>,
     /// This seed's provider lists that are incomplete, with why.
     pub incomplete: Vec<IncompleteList>,
-    /// Whether every provider returned this seed's whole list.
+    /// Whether every provider returned this seed's whole list; for
+    /// `related`, whether no provider's list is missing.
     pub complete: bool,
     /// Set when the seed itself is invalid (a malformed reference, or a
     /// citation key not in the library); no provider was asked for it, and
@@ -547,6 +549,10 @@ pub struct Identified {
     pub databases: BTreeMap<String, usize>,
     /// From citation searching (`refs`, `cited_by`).
     pub citation_searching: BTreeMap<String, usize>,
+    /// From the providers' related-works recommendations (`related`): also
+    /// PRISMA's "other methods", but reported apart from citation searching.
+    pub related_works: BTreeMap<String, usize>,
+    /// Every record identified, from all three.
     pub total: usize,
 }
 
@@ -744,7 +750,8 @@ impl PaxServer {
         let seeds = params.seeds()?;
         let logged =
             pax_core::references_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged, options.abstracts).map(Json)
+        self.citations(logged, Lists::Citations, options.abstracts)
+            .map(Json)
     }
 
     /// The papers citing one or more seed papers (forward snowballing);
@@ -760,7 +767,31 @@ impl PaxServer {
         let seeds = params.seeds()?;
         let logged =
             pax_core::cited_by_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged, options.abstracts).map(Json)
+        self.citations(logged, Lists::Citations, options.abstracts)
+            .map(Json)
+    }
+
+    /// The papers the providers themselves recommend as related to one or
+    /// more seed papers: OpenAlex's related works and Semantic Scholar's
+    /// recommendations. They aren't citation edges, so they reach beyond the
+    /// seeds' citation neighbourhood and make a snowballing start set more
+    /// varied. Input and output are as `refs`, `with_abstracts` and `label`
+    /// included. Recommendations have no total, so a related list is never
+    /// exhaustive: `incomplete` names only the missing lists (`failed`,
+    /// `unresolved`), and `complete` means no list is missing, not that
+    /// every related paper was returned. Recorded in the library's search
+    /// log, and counted in `stats` as `identified.related_works`.
+    #[tool]
+    async fn related(
+        &self,
+        Parameters(params): Parameters<CitationParams>,
+    ) -> Result<Json<CitationResults>, String> {
+        let options = params.paging.options()?;
+        let seeds = params.seeds()?;
+        let logged =
+            pax_core::related_many_logged(&seeds, &options, &self.root, &self.config).await;
+        self.citations(logged, Lists::Related, options.abstracts)
+            .map(Json)
     }
 
     /// Show one paper: by a provider reference from `search` (resolved live),
@@ -1036,6 +1067,7 @@ impl PaxServer {
     fn citations(
         &self,
         logged: Logged<SeedResults>,
+        lists: Lists,
         abstracts: bool,
     ) -> Result<CitationResults, String> {
         let Logged { results, log, .. } = logged;
@@ -1048,7 +1080,7 @@ impl PaxServer {
             return Err(invalid.join("; "));
         }
         let index = LibraryIndex::load(&self.root);
-        Ok(citation_results(&results, &index, log, abstracts))
+        Ok(citation_results(&results, &index, log, lists, abstracts))
     }
 }
 
@@ -1060,7 +1092,8 @@ impl ServerHandler for PaxServer {
             .with_instructions(
                 "Tools over a pax research library: search providers for papers \
                  (search, with abstracts on request), follow papers' \
-                 references and citations (refs, cited_by), show one by \
+                 references and citations (refs, cited_by) or the providers' \
+                 related-work recommendations (related), show one by \
                  reference, citation key, or DOI (show), \
                  add it to the library (add) or exclude it with a reason and \
                  the protocol's criterion (exclude, and unexclude to reverse \
@@ -1115,6 +1148,14 @@ fn search_results<E: Display>(
     }
 }
 
+/// What a multi-seed lookup returned: citation lists (`refs`, `cited_by`),
+/// which can be whole, or related works (`related`), which never are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lists {
+    Citations,
+    Related,
+}
+
 /// Each seed's report, and pax-core's list merged across every seed and
 /// provider, flagged against `index`, with each paper's abstract when
 /// `abstracts` were asked for.
@@ -1122,6 +1163,7 @@ fn citation_results(
     results: &SeedResults,
     index: &LibraryIndex,
     log: LogOutcome,
+    lists: Lists,
     abstracts: bool,
 ) -> CitationResults {
     let seed_name = |i: usize| results.seeds[i].seed.clone();
@@ -1133,6 +1175,7 @@ fn citation_results(
                 &seed.seed,
                 seed.same_as.map(seed_name),
                 seed.results.as_ref(),
+                lists,
             )
         })
         .collect();
@@ -1176,16 +1219,20 @@ fn citation_results(
 }
 
 /// One seed's per-provider reports and incomplete lists, or why the seed is
-/// invalid.
+/// invalid. A related list is never whole (it has no total), so for
+/// [`Lists::Related`] only the missing lists count as incomplete, as in the
+/// CLI.
 fn seed_report(
     seed: &str,
     same_as: Option<String>,
     results: Result<&pax_core::CitationResults, &PaxError>,
+    kind: Lists,
 ) -> SeedReport {
     match results {
         Ok(lists) => {
             let incomplete: Vec<IncompleteList> = pax_core::incomplete_lists(lists)
                 .into_iter()
+                .filter(|list| kind == Lists::Citations || list.reason.is_missing())
                 .map(|list| IncompleteList {
                     provider: list.provider.to_string(),
                     reason: list.reason.to_string(),
@@ -1588,6 +1635,7 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         identified: Identified {
             databases: stats.identified.databases,
             citation_searching: stats.identified.citation_searching,
+            related_works: stats.identified.related_works,
             total: stats.identified.total,
         },
         duplicates_removed: stats.duplicates_removed,
@@ -1739,6 +1787,7 @@ mod tests {
                 "fetch",
                 "list",
                 "refs",
+                "related",
                 "search",
                 "show",
                 "stats",
@@ -2244,7 +2293,7 @@ mod tests {
             ),
         ]);
 
-        let report = seed_report("openalex:W9", None, Ok(&lists));
+        let report = seed_report("openalex:W9", None, Ok(&lists), Lists::Citations);
 
         assert!(!report.complete);
         assert_eq!(report.incomplete.len(), 1);
@@ -2304,6 +2353,85 @@ mod tests {
         };
         assert!(server.refs(params()).await.is_err());
         assert!(server.cited_by(params()).await.is_err());
+        assert!(server.related(params()).await.is_err());
+    }
+
+    #[test]
+    fn a_related_list_is_never_whole_but_only_a_missing_one_is_incomplete() {
+        // A related list has no total, so pax-core calls it truncated.
+        let page = SearchPage::new(
+            vec![work(ProviderId::OpenAlex, "W1", "A", Some("10.1000/a"))],
+            None,
+            None,
+        );
+        let lists: pax_core::CitationResults = HashMap::from([
+            (ProviderId::OpenAlex, Ok(page)),
+            (
+                ProviderId::SemanticScholar,
+                Err(pax_core::CitationError::Provider(ProviderError::Request(
+                    "timed out".to_string(),
+                ))),
+            ),
+        ]);
+
+        let related = seed_report("openalex:W9", None, Ok(&lists), Lists::Related);
+        let incomplete: Vec<_> = related
+            .incomplete
+            .iter()
+            .map(|list| (list.provider.as_str(), list.reason.as_str()))
+            .collect();
+        assert_eq!(incomplete, [("semanticscholar", "failed")]);
+        assert!(!related.complete);
+        assert!(!related.providers[0].complete && related.providers[0].total.is_none());
+
+        let openalex_only: pax_core::CitationResults = HashMap::from([(
+            ProviderId::OpenAlex,
+            Ok(SearchPage::new(Vec::new(), None, None)),
+        )]);
+        let as_related = seed_report("openalex:W9", None, Ok(&openalex_only), Lists::Related);
+        assert!(as_related.incomplete.is_empty() && as_related.complete);
+        let as_citations = seed_report("openalex:W9", None, Ok(&openalex_only), Lists::Citations);
+        assert_eq!(as_citations.incomplete[0].reason, "truncated");
+    }
+
+    #[tokio::test]
+    async fn related_reports_unresolvable_seeds_and_logs_them() {
+        let root = library_with_two_papers("related");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        // As for refs: hewitt1973 resolves at no provider, so no request is
+        // made, and dijkstra1968 isn't in the library.
+        let Json(out) = server
+            .related(seeds(&["hewitt1973", "dijkstra1968"]))
+            .await
+            .unwrap();
+        let reasons: Vec<_> = out.seeds[0]
+            .incomplete
+            .iter()
+            .map(|list| list.reason.as_str())
+            .collect();
+        assert_eq!(reasons, ["unresolved", "unresolved"]);
+        assert!(
+            out.seeds[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("dijkstra1968")
+        );
+        assert!(!out.complete && out.results.is_empty());
+        assert!(out.log.logged);
+        let log = fs::read_to_string(root.join("research/search-log.jsonl")).unwrap();
+        assert!(
+            log.lines()
+                .all(|line| line.contains(r#""command":"related""#)),
+            "{log}"
+        );
+
+        let Json(stats) = server.stats().await.unwrap();
+        assert_eq!(stats.identified.total, 0);
+        assert!(stats.identified.related_works.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn exclusion(reference: &str, reason: &str, title: Option<&str>) -> Parameters<ExcludeParams> {
@@ -2547,6 +2675,41 @@ mod tests {
             })
             .collect();
         assert_eq!(by_label, [(Some("R1"), 3, 3, 3, 0)]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_counts_related_works_apart_from_citation_searching() {
+        let root = library_with_two_papers("stats-related");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let page = SearchPage::new(
+            vec![
+                work(ProviderId::SemanticScholar, "S1", "A", Some("10.1000/a")),
+                work(ProviderId::SemanticScholar, "S2", "B", Some("10.1000/b")),
+            ],
+            None,
+            None,
+        );
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> =
+            HashMap::from([(ProviderId::SemanticScholar, Ok(page))]);
+        let logged = pax_core::log_results(
+            &root,
+            pax_core::SearchCommand::Related,
+            "openalex:W1",
+            &SearchOptions::default(),
+            &results,
+        );
+        assert!(matches!(logged, LogOutcome::Written(_)));
+
+        let Json(stats) = server.stats().await.unwrap();
+        assert_eq!(
+            stats.identified.related_works.get("semanticscholar"),
+            Some(&2)
+        );
+        assert!(stats.identified.citation_searching.is_empty());
+        assert!(stats.identified.databases.is_empty());
+        assert_eq!(stats.identified.total, 2);
 
         fs::remove_dir_all(root).unwrap();
     }
