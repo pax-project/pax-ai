@@ -504,6 +504,26 @@ pub struct PrismaStats {
     /// When 0, `records_screened = excluded_screening + reports_sought +
     /// awaiting_screening`.
     pub decided_outside_log: usize,
+    /// The records identified under each search-log `label`, labels in the
+    /// order they first appear in the log; unlabelled searches are one
+    /// group, with `label: null`. Empty for an empty log.
+    pub by_label: Vec<LabelCount>,
+}
+
+/// The records identified under one search-log label.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelCount {
+    /// The label; null for the searches without one.
+    pub label: Option<String>,
+    /// Records retrieved by the label's searches.
+    pub identified: usize,
+    /// Distinct papers among them.
+    pub distinct: usize,
+    /// Distinct papers no earlier label identified; summed over every
+    /// label, it gives `records_screened`.
+    pub new_distinct: usize,
+    /// Duplicates within the label: `identified - distinct`.
+    pub duplicates: usize,
 }
 
 /// Records identified, per provider tag (e.g. `openalex`).
@@ -854,9 +874,10 @@ impl PaxServer {
     /// removed, records screened, exclusions at each stage (full-text ones
     /// by reason, both stages by criterion), papers still awaiting a
     /// screening decision, reports sought (papers that passed screening),
-    /// reports not retrieved, and papers included. Mid-round, report
-    /// `awaiting_screening` as still to screen, not as passed. Computed from
-    /// the library's files; nothing is written.
+    /// reports not retrieved, and papers included; then the records
+    /// identified under each search-log `label` (`by_label`). Mid-round,
+    /// report `awaiting_screening` as still to screen, not as passed.
+    /// Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
         self.papers_path()?;
@@ -1021,7 +1042,8 @@ impl ServerHandler for PaxServer {
                  reproduce (check), list what's declared (list), export it as \
                  BibTeX text (export), and report PRISMA flow counts (stats). \
                  Writes go to research/ through pax-core, and searches are \
-                 recorded in research/search-log.jsonl.",
+                 recorded in research/search-log.jsonl, under a `label` when \
+                 given, which stats counts by.",
             )
     }
 }
@@ -1559,6 +1581,17 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         included: stats.included,
         skipped_log_lines: stats.skipped_log_lines,
         decided_outside_log: stats.decided_outside_log,
+        by_label: stats
+            .by_label
+            .into_iter()
+            .map(|l| LabelCount {
+                label: l.label,
+                identified: l.identified,
+                distinct: l.distinct,
+                new_distinct: l.new_distinct,
+                duplicates: l.duplicates,
+            })
+            .collect(),
     }
 }
 
@@ -2357,7 +2390,7 @@ mod tests {
             &root,
             pax_core::SearchCommand::Search,
             "computable",
-            &SearchOptions::default(),
+            &SearchOptions::default().with_label("R1"),
             &results,
         );
         assert!(matches!(logged, LogOutcome::Written(_)));
@@ -2392,6 +2425,20 @@ mod tests {
             .map(|c| (c.criterion.as_deref(), c.count))
             .collect();
         assert_eq!(full_text, [(Some("X2"), 1)]);
+        let by_label: Vec<_> = stats
+            .by_label
+            .iter()
+            .map(|l| {
+                (
+                    l.label.as_deref(),
+                    l.identified,
+                    l.distinct,
+                    l.new_distinct,
+                    l.duplicates,
+                )
+            })
+            .collect();
+        assert_eq!(by_label, [(Some("R1"), 3, 3, 3, 0)]);
 
         fs::remove_dir_all(root).unwrap();
     }
