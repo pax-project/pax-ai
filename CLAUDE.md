@@ -48,7 +48,7 @@ pax-core 2.0's enums and several of its structs are `#[non_exhaustive]`: matches
 ## MCP server notes
 
 - Tools return this crate's own `Serialize` + `JsonSchema` types (`src/mcp.rs`), since pax-core's types don't derive `JsonSchema` (most don't derive `Serialize` either). Conversion lives in plain functions (`search_results`, `log_status`, `prisma_stats`, …) so it's testable without the network.
-- `search`, `refs`, and `cited_by` call pax-core's `*_logged` variants (`references_many_logged`/`cited_by_many_logged` for the citation tools, even for one seed), so an agent's searches land in `research/search-log.jsonl` with the CLI's; the result's `log` says when nothing was logged (no library, or the write failed). Never call the unlogged `search_*`/`references`/`cited_by` from a tool.
+- `search`, `refs`, `cited_by`, and `related` call pax-core's `*_logged` variants (`references_many_logged`/`cited_by_many_logged`/`related_many_logged` for the seed tools, even for one seed), so an agent's searches land in `research/search-log.jsonl` with the CLI's; the result's `log` says when nothing was logged (no library, or the write failed). Never call the unlogged `search_*`/`references`/`cited_by`/`related` from a tool.
 - `show { doi }` calls the unlogged `search_by_doi` (pax-core has no logged variant): it's a lookup of a known paper, not a search for PRISMA's identified count.
 - `fetch` and `check` shell out to `nix`, so they run on tokio's blocking pool (`spawn_blocking`); `fetch` also has an overall timeout. A paper that can't be fetched is a `FetchResult` status with a reason, not a tool error.
 - In-library/excluded flags come from `LibraryIndex`, which matches by DOI or arXiv id; don't use the deprecated `known_dois`/`excluded_keys`.
