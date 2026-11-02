@@ -17,9 +17,9 @@ use std::time::Duration;
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
-    Exclusion, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter,
-    LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderError, ProviderId,
-    ResolvedArtifact, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
+    Exclusion, ExclusionOptions, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex,
+    Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderError,
+    ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -171,6 +171,17 @@ pub struct ExcludeParams {
     /// Title to record; overrides the provider's, and is needed when the
     /// reference can't be resolved. With a bare DOI, no provider is asked.
     pub title: Option<String>,
+    /// Publication year to record; overrides the provider's. Give it with
+    /// `title` for a reference that can't be resolved: without a year,
+    /// `stats` can't match an exclusion keyed by a provider reference to
+    /// its logged record, which then stays awaiting screening.
+    pub year: Option<i32>,
+    /// The protocol's exclusion criterion, e.g. `X3` (free text), so
+    /// `stats` can group exclusions by criterion.
+    pub criterion: Option<String>,
+    /// The screening round, e.g. `R1` (free text); meant to match the
+    /// search log's labels.
+    pub round: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -439,6 +450,12 @@ pub struct Excluded {
     pub reason: String,
     /// `screening` or `full-text`.
     pub stage: String,
+    /// The paper's publication year, when known.
+    pub year: Option<i32>,
+    /// The protocol's exclusion criterion, when recorded.
+    pub criterion: Option<String>,
+    /// The screening round, when recorded.
+    pub round: Option<String>,
 }
 
 /// A library's PRISMA 2020 flow-diagram counts, computed by pax-core from
@@ -741,8 +758,10 @@ impl PaxServer {
     }
 
     /// Exclude a paper from the review: record it in research/excluded.nix
-    /// with a reason and a stage (`screening` or `full-text`), replacing any
-    /// earlier exclusion of it. Excluded papers are flagged in `search`,
+    /// with a reason and a stage (`screening` or `full-text`), and optionally
+    /// the protocol's `criterion`, the screening `round` and the paper's
+    /// `year`, replacing any earlier exclusion of it (so a criterion or round
+    /// not given again is cleared). Excluded papers are flagged in `search`,
     /// `refs`, and `cited_by` results. A paper declared in the library is
     /// refused; it must be removed first. `add` refuses an excluded paper
     /// until `unexclude` reverses the decision.
@@ -751,19 +770,18 @@ impl PaxServer {
         &self,
         Parameters(params): Parameters<ExcludeParams>,
     ) -> Result<Json<Excluded>, String> {
-        let exclusion = pax_core::exclude_paper(
-            &params.reference,
-            &params.reason,
-            params.stage.into(),
-            params.title.as_deref(),
-            &self.root,
-            &self.config,
-        )
-        .await
-        .map_err(|e| match e {
-            PaxError::ExclusionTitleUnresolved(..) => format!("{e} with `title`"),
-            other => other.to_string(),
-        })?;
+        let options = ExclusionOptions::new(params.reason, params.stage.into())
+            .with_title(params.title)
+            .with_year(params.year)
+            .with_criterion(params.criterion)
+            .with_round(params.round);
+        let exclusion =
+            pax_core::exclude_paper_with(&params.reference, &options, &self.root, &self.config)
+                .await
+                .map_err(|e| match e {
+                    PaxError::ExclusionTitleUnresolved(..) => format!("{e} with `title`"),
+                    other => other.to_string(),
+                })?;
         Ok(Json(excluded(exclusion)))
     }
 
@@ -963,9 +981,9 @@ impl ServerHandler for PaxServer {
                 "Tools over a pax research library: search providers for papers \
                  (search), follow papers' references and citations (refs, \
                  cited_by), show one by reference, citation key, or DOI (show), \
-                 add it to the library (add) or exclude it with a reason \
-                 (exclude, and unexclude to reverse an exclusion the reviewer \
-                 reconsiders), tag and annotate declared papers (edit), fetch a \
+                 add it to the library (add) or exclude it with a reason and \
+                 the protocol's criterion (exclude, and unexclude to reverse \
+                 an exclusion the reviewer reconsiders), tag and annotate declared papers (edit), fetch a \
                  paper's PDF through Nix (fetch, which can take minutes), verify \
                  fetched PDFs still reproduce (check), list what's declared \
                  (list), export it as BibTeX text (export), and report PRISMA \
@@ -1270,6 +1288,9 @@ fn excluded(exclusion: Exclusion) -> Excluded {
         title: exclusion.title,
         reason: exclusion.reason,
         stage: exclusion.stage.to_string(),
+        year: exclusion.year,
+        criterion: exclusion.criterion,
+        round: exclusion.round,
     }
 }
 
@@ -2064,6 +2085,9 @@ mod tests {
             reason: reason.to_string(),
             stage: Stage::FullText,
             title: title.map(str::to_string),
+            year: None,
+            criterion: None,
+            round: None,
         })
     }
 
@@ -2072,12 +2096,18 @@ mod tests {
         let root = library_with_two_papers("exclude");
         let server = PaxServer::new(root.clone(), Config::default());
 
+        let Parameters(params) = exclusion(
+            "https://doi.org/10.1000/Off-Topic",
+            "not empirical",
+            Some("An Essay"),
+        );
         let Json(excluded) = server
-            .exclude(exclusion(
-                "https://doi.org/10.1000/Off-Topic",
-                "not empirical",
-                Some("An Essay"),
-            ))
+            .exclude(Parameters(ExcludeParams {
+                year: Some(2019),
+                criterion: Some("X3".to_string()),
+                round: Some(" R1 ".to_string()),
+                ..params
+            }))
             .await
             .unwrap();
         assert_eq!(excluded.key, "10.1000/off-topic");
@@ -2086,6 +2116,9 @@ mod tests {
             (excluded.title.as_str(), excluded.reason.as_str()),
             ("An Essay", "not empirical")
         );
+        assert_eq!(excluded.year, Some(2019));
+        assert_eq!(excluded.criterion.as_deref(), Some("X3"));
+        assert_eq!(excluded.round.as_deref(), Some("R1"));
 
         let excluded_work = work(
             ProviderId::OpenAlex,
@@ -2094,6 +2127,16 @@ mod tests {
             Some("10.1000/off-topic"),
         );
         assert!(LibraryIndex::load(&root).is_excluded(&excluded_work));
+        let recorded = Exclusions::load(&pax_core::nix::excluded_path(&root)).unwrap();
+        let recorded = recorded.get("10.1000/off-topic").unwrap();
+        assert_eq!(
+            (
+                recorded.year,
+                recorded.criterion.as_deref(),
+                recorded.round.as_deref()
+            ),
+            (Some(2019), Some("X3"), Some("R1"))
+        );
         let Json(listed) = server
             .list(Parameters(ListParams::default()))
             .await
@@ -2134,12 +2177,13 @@ mod tests {
     async fn unexclude_removes_an_exclusion_by_its_doi_without_the_network() {
         let root = library_with_two_papers("unexclude");
         let server = PaxServer::new(root.clone(), Config::default());
+        let Parameters(params) = exclusion("10.1000/essay", "not empirical", Some("An Essay"));
         server
-            .exclude(exclusion(
-                "10.1000/essay",
-                "not empirical",
-                Some("An Essay"),
-            ))
+            .exclude(Parameters(ExcludeParams {
+                criterion: Some("X1".to_string()),
+                round: Some("R2".to_string()),
+                ..params
+            }))
             .await
             .unwrap();
 
@@ -2151,6 +2195,8 @@ mod tests {
             .unwrap();
         assert_eq!(removed.key, "10.1000/essay");
         assert_eq!(removed.reason, "not empirical");
+        assert_eq!(removed.criterion.as_deref(), Some("X1"));
+        assert_eq!(removed.round.as_deref(), Some("R2"));
         let essay = work(
             ProviderId::OpenAlex,
             "W2",
