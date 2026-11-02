@@ -47,6 +47,10 @@ pub struct PagingParams {
     pub doc_type: Option<String>,
     /// Language, as an ISO 639-1 code (e.g. `en`).
     pub language: Option<String>,
+    /// A label recorded on every search-log line this call writes, e.g.
+    /// `R2-backward`, so `stats` can count each round apart (`by_label`).
+    /// It doesn't change what is searched; a blank label is refused.
+    pub label: Option<String>,
 }
 
 impl PagingParams {
@@ -77,7 +81,14 @@ impl PagingParams {
             }
             filters = filters.with_language(language);
         }
-        Ok(defaults.with_limit(limit).with_filters(filters))
+        let options = defaults.with_limit(limit).with_filters(filters);
+        match &self.label {
+            Some(label) if label.trim().is_empty() => {
+                Err("`label` must not be blank, e.g. `R2-backward`".to_string())
+            }
+            Some(label) => Ok(options.with_label(label.trim())),
+            None => Ok(options),
+        }
     }
 }
 
@@ -493,6 +504,26 @@ pub struct PrismaStats {
     /// When 0, `records_screened = excluded_screening + reports_sought +
     /// awaiting_screening`.
     pub decided_outside_log: usize,
+    /// The records identified under each search-log `label`, labels in the
+    /// order they first appear in the log; unlabelled searches are one
+    /// group, with `label: null`. Empty for an empty log.
+    pub by_label: Vec<LabelCount>,
+}
+
+/// The records identified under one search-log label.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelCount {
+    /// The label; null for the searches without one.
+    pub label: Option<String>,
+    /// Records retrieved by the label's searches.
+    pub identified: usize,
+    /// Distinct papers among them.
+    pub distinct: usize,
+    /// Distinct papers no earlier label identified; summed over every
+    /// label, it gives `records_screened`.
+    pub new_distinct: usize,
+    /// Duplicates within the label: `identified - distinct`.
+    pub duplicates: usize,
 }
 
 /// Records identified, per provider tag (e.g. `openalex`).
@@ -650,7 +681,8 @@ impl PaxServer {
     /// and language. Reports each provider's retrieved/total counts, then one
     /// list merged across providers, each paper flagged if it's already in
     /// the library or excluded. Any result `id` works with `show` and `add`.
-    /// The search is recorded in the library's search log.
+    /// The search is recorded in the library's search log, under `label`
+    /// when given.
     #[tool]
     async fn search(
         &self,
@@ -681,7 +713,7 @@ impl PaxServer {
     /// the paper's references from its own reference list (its
     /// bibliography) instead. `truncated` only means `limit` stopped
     /// retrieval; ask again with a higher `limit` or `all`. Recorded in the
-    /// library's search log.
+    /// library's search log, under `label` when given.
     #[tool]
     async fn refs(
         &self,
@@ -842,9 +874,10 @@ impl PaxServer {
     /// removed, records screened, exclusions at each stage (full-text ones
     /// by reason, both stages by criterion), papers still awaiting a
     /// screening decision, reports sought (papers that passed screening),
-    /// reports not retrieved, and papers included. Mid-round, report
-    /// `awaiting_screening` as still to screen, not as passed. Computed from
-    /// the library's files; nothing is written.
+    /// reports not retrieved, and papers included; then the records
+    /// identified under each search-log `label` (`by_label`). Mid-round,
+    /// report `awaiting_screening` as still to screen, not as passed.
+    /// Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
         self.papers_path()?;
@@ -1009,7 +1042,8 @@ impl ServerHandler for PaxServer {
                  reproduce (check), list what's declared (list), export it as \
                  BibTeX text (export), and report PRISMA flow counts (stats). \
                  Writes go to research/ through pax-core, and searches are \
-                 recorded in research/search-log.jsonl.",
+                 recorded in research/search-log.jsonl, under a `label` when \
+                 given, which stats counts by.",
             )
     }
 }
@@ -1547,6 +1581,17 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         included: stats.included,
         skipped_log_lines: stats.skipped_log_lines,
         decided_outside_log: stats.decided_outside_log,
+        by_label: stats
+            .by_label
+            .into_iter()
+            .map(|l| LabelCount {
+                label: l.label,
+                identified: l.identified,
+                distinct: l.distinct,
+                new_distinct: l.new_distinct,
+                duplicates: l.duplicates,
+            })
+            .collect(),
     }
 }
 
@@ -1751,9 +1796,11 @@ mod tests {
             "year": "1970-1980",
             "type": "journal-article",
             "language": "EN",
+            "label": " R2-backward ",
         }))
         .unwrap();
         let options = params.paging.options().unwrap();
+        assert_eq!(options.label.as_deref(), Some("R2-backward"));
         assert_eq!(options.limit, Limit::Count(10));
         assert_eq!(
             options.filters.years,
@@ -1797,6 +1844,10 @@ mod tests {
             },
             PagingParams {
                 language: Some(" ".to_string()),
+                ..PagingParams::default()
+            },
+            PagingParams {
+                label: Some("  ".to_string()),
                 ..PagingParams::default()
             },
         ];
@@ -2029,6 +2080,39 @@ mod tests {
         assert!(!out.complete);
         assert!(out.results.is_empty());
         assert!(out.log.logged, "the valid seeds' lookups are logged");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_label_lands_on_every_log_line_the_tool_writes() {
+        let root = library_with_two_papers("citations-label");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        // hewitt1973 resolves at no provider, so nothing is requested, but
+        // each provider's lookup is still logged.
+        let Json(out) = server
+            .cited_by(Parameters(CitationParams {
+                reference: Some("hewitt1973".to_string()),
+                paging: PagingParams {
+                    label: Some("R2-forward".to_string()),
+                    ..PagingParams::default()
+                },
+                ..CitationParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(out.log.logged);
+
+        let log = fs::read_to_string(root.join("research/search-log.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for line in &lines {
+            assert_eq!(line["label"], "R2-forward", "{line}");
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2306,7 +2390,7 @@ mod tests {
             &root,
             pax_core::SearchCommand::Search,
             "computable",
-            &SearchOptions::default(),
+            &SearchOptions::default().with_label("R1"),
             &results,
         );
         assert!(matches!(logged, LogOutcome::Written(_)));
@@ -2341,6 +2425,20 @@ mod tests {
             .map(|c| (c.criterion.as_deref(), c.count))
             .collect();
         assert_eq!(full_text, [(Some("X2"), 1)]);
+        let by_label: Vec<_> = stats
+            .by_label
+            .iter()
+            .map(|l| {
+                (
+                    l.label.as_deref(),
+                    l.identified,
+                    l.distinct,
+                    l.new_distinct,
+                    l.duplicates,
+                )
+            })
+            .collect();
+        assert_eq!(by_label, [(Some("R1"), 3, 3, 3, 0)]);
 
         fs::remove_dir_all(root).unwrap();
     }
