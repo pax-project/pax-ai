@@ -47,6 +47,10 @@ pub struct PagingParams {
     pub doc_type: Option<String>,
     /// Language, as an ISO 639-1 code (e.g. `en`).
     pub language: Option<String>,
+    /// A label recorded on every search-log line this call writes, e.g.
+    /// `R2-backward`, so `stats` can count each round apart (`by_label`).
+    /// It doesn't change what is searched; a blank label is refused.
+    pub label: Option<String>,
 }
 
 impl PagingParams {
@@ -77,7 +81,14 @@ impl PagingParams {
             }
             filters = filters.with_language(language);
         }
-        Ok(defaults.with_limit(limit).with_filters(filters))
+        let options = defaults.with_limit(limit).with_filters(filters);
+        match &self.label {
+            Some(label) if label.trim().is_empty() => {
+                Err("`label` must not be blank, e.g. `R2-backward`".to_string())
+            }
+            Some(label) => Ok(options.with_label(label.trim())),
+            None => Ok(options),
+        }
     }
 }
 
@@ -650,7 +661,8 @@ impl PaxServer {
     /// and language. Reports each provider's retrieved/total counts, then one
     /// list merged across providers, each paper flagged if it's already in
     /// the library or excluded. Any result `id` works with `show` and `add`.
-    /// The search is recorded in the library's search log.
+    /// The search is recorded in the library's search log, under `label`
+    /// when given.
     #[tool]
     async fn search(
         &self,
@@ -681,7 +693,7 @@ impl PaxServer {
     /// the paper's references from its own reference list (its
     /// bibliography) instead. `truncated` only means `limit` stopped
     /// retrieval; ask again with a higher `limit` or `all`. Recorded in the
-    /// library's search log.
+    /// library's search log, under `label` when given.
     #[tool]
     async fn refs(
         &self,
@@ -1751,9 +1763,11 @@ mod tests {
             "year": "1970-1980",
             "type": "journal-article",
             "language": "EN",
+            "label": " R2-backward ",
         }))
         .unwrap();
         let options = params.paging.options().unwrap();
+        assert_eq!(options.label.as_deref(), Some("R2-backward"));
         assert_eq!(options.limit, Limit::Count(10));
         assert_eq!(
             options.filters.years,
@@ -1797,6 +1811,10 @@ mod tests {
             },
             PagingParams {
                 language: Some(" ".to_string()),
+                ..PagingParams::default()
+            },
+            PagingParams {
+                label: Some("  ".to_string()),
                 ..PagingParams::default()
             },
         ];
@@ -2029,6 +2047,39 @@ mod tests {
         assert!(!out.complete);
         assert!(out.results.is_empty());
         assert!(out.log.logged, "the valid seeds' lookups are logged");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_label_lands_on_every_log_line_the_tool_writes() {
+        let root = library_with_two_papers("citations-label");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        // hewitt1973 resolves at no provider, so nothing is requested, but
+        // each provider's lookup is still logged.
+        let Json(out) = server
+            .cited_by(Parameters(CitationParams {
+                reference: Some("hewitt1973".to_string()),
+                paging: PagingParams {
+                    label: Some("R2-forward".to_string()),
+                    ..PagingParams::default()
+                },
+                ..CitationParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(out.log.logged);
+
+        let log = fs::read_to_string(root.join("research/search-log.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for line in &lines {
+            assert_eq!(line["label"], "R2-forward", "{line}");
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
