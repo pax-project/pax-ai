@@ -25,7 +25,7 @@ Early: the LLM port with Anthropic and Ollama adapters, cached summaries, and a 
 - `check`: verify every fetched paper's PDF still reproduces from its recorded hash, as `pax check` does: one report per paper (`not-fetched`, `reproducible`, `mismatch`, `error`) plus totals.
 - `list`: declared papers, filtered by author, year, and tag.
 - `export`: BibTeX text (`format: "bibtex"`) for the whole library, or for the given citation `keys` and/or a `tag`. The text is returned, not written to a file.
-- `stats`: the review's PRISMA 2020 flow-diagram counts (records identified per provider, duplicates removed, records screened, exclusions per stage with full-text reasons, papers awaiting a screening decision, reports sought, reports not retrieved, papers included, and decisions made outside the search log), computed by pax-core from the library's files.
+- `stats`: the review's PRISMA 2020 flow-diagram counts (records identified per provider, duplicates removed, records screened, exclusions per stage with full-text reasons and both stages by criterion, papers awaiting a screening decision, reports sought, reports not retrieved, papers included, and decisions made outside the search log), computed by pax-core from the library's files.
 
 `search`, `refs`, and `cited_by` are recorded in `research/search-log.jsonl`, the same log the `pax` CLI writes, and each result's `log` says whether it was recorded and, if not, why.
 

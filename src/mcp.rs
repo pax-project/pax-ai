@@ -482,6 +482,8 @@ pub struct PrismaStats {
     /// `reports_sought - not_retrieved`.
     pub reports_assessed: usize,
     pub excluded_full_text: FullTextExclusions,
+    /// Exclusions at each stage, by the protocol's criterion.
+    pub excluded_by_criterion: CriterionExclusions,
     /// Declared papers with a fetchable artifact.
     pub included: usize,
     /// Search-log lines whose provider failed; they count nowhere else.
@@ -513,6 +515,23 @@ pub struct FullTextExclusions {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReasonCount {
     pub reason: String,
+    pub count: usize,
+}
+
+/// Exclusions at each stage, grouped by criterion. Each stage has one entry
+/// per distinct criterion (sorted), then one with `criterion: null` for the
+/// exclusions recording none; a stage with no exclusions has no entries.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CriterionExclusions {
+    /// Title/abstract screening exclusions.
+    pub screening: Vec<CriterionCount>,
+    /// Full-text exclusions.
+    pub full_text: Vec<CriterionCount>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CriterionCount {
+    pub criterion: Option<String>,
     pub count: usize,
 }
 
@@ -821,7 +840,7 @@ impl PaxServer {
     /// The review's PRISMA 2020 flow-diagram counts: records identified per
     /// provider (database searches and citation searching), duplicates
     /// removed, records screened, exclusions at each stage (full-text ones
-    /// by reason), papers still awaiting a screening decision, reports sought
+    /// by reason, both stages by criterion), papers still awaiting a screening decision, reports sought
     /// (papers that passed screening), reports not retrieved, and papers
     /// included. Mid-round, report `awaiting_screening` as still to screen,
     /// not as passed. Computed from the library's files; nothing is written.
@@ -1519,10 +1538,24 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
                 })
                 .collect(),
         },
+        excluded_by_criterion: CriterionExclusions {
+            screening: criterion_counts(stats.excluded_by_criterion.screening),
+            full_text: criterion_counts(stats.excluded_by_criterion.full_text),
+        },
         included: stats.included,
         skipped_log_lines: stats.skipped_log_lines,
         decided_outside_log: stats.decided_outside_log,
     }
+}
+
+fn criterion_counts(counts: Vec<pax_core::CriterionCount>) -> Vec<CriterionCount> {
+    counts
+        .into_iter()
+        .map(|c| CriterionCount {
+            criterion: c.criterion,
+            count: c.count,
+        })
+        .collect()
 }
 
 fn declared(paper: &Paper) -> DeclaredPaper {
@@ -2275,12 +2308,12 @@ mod tests {
             &results,
         );
         assert!(matches!(logged, LogOutcome::Written(_)));
+        let Parameters(params) = exclusion("10.1000/essay", "not empirical", Some("An Essay"));
         server
-            .exclude(exclusion(
-                "10.1000/essay",
-                "not empirical",
-                Some("An Essay"),
-            ))
+            .exclude(Parameters(ExcludeParams {
+                criterion: Some("X2".to_string()),
+                ..params
+            }))
             .await
             .unwrap();
 
@@ -2298,6 +2331,14 @@ mod tests {
         assert_eq!(stats.excluded_full_text.total, 1);
         assert_eq!(stats.excluded_full_text.reasons[0].reason, "not empirical");
         assert_eq!(stats.excluded_full_text.reasons[0].count, 1);
+        assert!(stats.excluded_by_criterion.screening.is_empty());
+        let full_text: Vec<_> = stats
+            .excluded_by_criterion
+            .full_text
+            .iter()
+            .map(|c| (c.criterion.as_deref(), c.count))
+            .collect();
+        assert_eq!(full_text, [(Some("X2"), 1)]);
 
         fs::remove_dir_all(root).unwrap();
     }
