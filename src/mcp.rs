@@ -453,11 +453,15 @@ pub struct DoiRecords {
     pub results: Vec<MergedHit>,
 }
 
-/// Exactly one field is set: `declared` for a citation key, `candidate` for
-/// a provider reference, `records` for a DOI.
+/// Exactly one field is set: `declared` for a paper in the library,
+/// `excluded` for an excluded paper named by its alias, `candidate` for a
+/// provider reference, `records` for a DOI.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ShowOutput {
     pub declared: Option<DeclaredPaper>,
+    /// The paper's exclusion record: it was excluded from the review, so
+    /// it isn't in the library.
+    pub excluded: Option<Excluded>,
     pub candidate: Option<Candidate>,
     pub records: Option<DoiRecords>,
 }
@@ -812,6 +816,7 @@ impl PaxServer {
                 let index = LibraryIndex::load(&self.root);
                 return Ok(Json(ShowOutput {
                     declared: None,
+                    excluded: None,
                     candidate: None,
                     records: Some(doi_records(doi, &results, &index)),
                 }));
@@ -824,6 +829,13 @@ impl PaxServer {
         Ok(Json(match shown {
             ShowResult::Declared(paper) => ShowOutput {
                 declared: Some(declared(&paper)),
+                excluded: None,
+                candidate: None,
+                records: None,
+            },
+            ShowResult::Excluded(exclusion) => ShowOutput {
+                declared: None,
+                excluded: Some(excluded(exclusion)),
                 candidate: None,
                 records: None,
             },
@@ -831,6 +843,7 @@ impl PaxServer {
                 let index = LibraryIndex::load(&self.root);
                 ShowOutput {
                     declared: None,
+                    excluded: None,
                     candidate: Some(candidate(
                         &work,
                         index.contains(&work),
@@ -1450,12 +1463,10 @@ fn paper_edits(
     if add_tags.is_empty() && remove_tags.is_empty() && notes.is_none() {
         return Err("nothing to edit: give `add_tags`, `remove_tags`, and/or `notes`".to_string());
     }
-    Ok(PaperEdits {
-        add_tags,
-        remove_tags,
-        notes,
-        ..PaperEdits::default()
-    })
+    Ok(PaperEdits::new()
+        .with_add_tags(add_tags)
+        .with_remove_tags(remove_tags)
+        .with_notes(notes))
 }
 
 /// The papers `export` renders, in library order: those named in `keys`
