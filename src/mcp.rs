@@ -547,6 +547,10 @@ pub struct Identified {
     pub databases: BTreeMap<String, usize>,
     /// From citation searching (`refs`, `cited_by`).
     pub citation_searching: BTreeMap<String, usize>,
+    /// From the providers' related-works recommendations (`related`): also
+    /// PRISMA's "other methods", but reported apart from citation searching.
+    pub related_works: BTreeMap<String, usize>,
+    /// Every record identified, from all three.
     pub total: usize,
 }
 
@@ -1588,6 +1592,7 @@ fn prisma_stats(stats: pax_core::Stats) -> PrismaStats {
         identified: Identified {
             databases: stats.identified.databases,
             citation_searching: stats.identified.citation_searching,
+            related_works: stats.identified.related_works,
             total: stats.identified.total,
         },
         duplicates_removed: stats.duplicates_removed,
@@ -2547,6 +2552,41 @@ mod tests {
             })
             .collect();
         assert_eq!(by_label, [(Some("R1"), 3, 3, 3, 0)]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_counts_related_works_apart_from_citation_searching() {
+        let root = library_with_two_papers("stats-related");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let page = SearchPage::new(
+            vec![
+                work(ProviderId::SemanticScholar, "S1", "A", Some("10.1000/a")),
+                work(ProviderId::SemanticScholar, "S2", "B", Some("10.1000/b")),
+            ],
+            None,
+            None,
+        );
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> =
+            HashMap::from([(ProviderId::SemanticScholar, Ok(page))]);
+        let logged = pax_core::log_results(
+            &root,
+            pax_core::SearchCommand::Related,
+            "openalex:W1",
+            &SearchOptions::default(),
+            &results,
+        );
+        assert!(matches!(logged, LogOutcome::Written(_)));
+
+        let Json(stats) = server.stats().await.unwrap();
+        assert_eq!(
+            stats.identified.related_works.get("semanticscholar"),
+            Some(&2)
+        );
+        assert!(stats.identified.citation_searching.is_empty());
+        assert!(stats.identified.databases.is_empty());
+        assert_eq!(stats.identified.total, 2);
 
         fs::remove_dir_all(root).unwrap();
     }
