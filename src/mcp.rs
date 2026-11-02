@@ -18,8 +18,9 @@ use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
     Exclusion, ExclusionOptions, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex,
-    Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderError,
-    ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
+    Limit, ListFilter, LogOutcome, Logged, MergedWork, NameHolder, Paper, PaperEdits, PaxError,
+    ProviderError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults,
+    ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -113,8 +114,9 @@ pub struct SearchParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CitationParams {
     /// One seed paper: a provider reference (e.g. `openalex:W2072794470`,
-    /// from any provider) or the citation key of a paper in the library.
-    /// Give exactly one of `reference` or `references`.
+    /// from any provider), the citation key or alias of a paper in the
+    /// library, or an excluded paper's alias. Give exactly one of
+    /// `reference` or `references`.
     pub reference: Option<String>,
     /// Several seed papers, each as `reference`, for one snowballing round:
     /// each seed is reported on its own, and the results are merged across
@@ -144,8 +146,9 @@ pub struct ReferenceParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ShowParams {
-    /// A provider reference from `search` (e.g. `openalex:W2072794470`) or the
-    /// citation key of a paper in the library. Give exactly one of
+    /// A provider reference from `search` (e.g. `openalex:W2072794470`), the
+    /// citation key or alias of a paper in the library (e.g. `turing1936`
+    /// or `P17`), or an excluded paper's alias. Give exactly one of
     /// `reference` or `doi`.
     pub reference: Option<String>,
     /// A DOI (bare or `https://doi.org/...`), looked up at every provider
@@ -156,7 +159,8 @@ pub struct ShowParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CitationKeyParams {
-    /// The citation key of a paper in the library, e.g. `turing1936`.
+    /// The citation key or alias of a paper in the library, e.g.
+    /// `turing1936` or `P17`.
     pub reference: String,
 }
 
@@ -201,18 +205,23 @@ pub struct ExcludeParams {
     /// The screening round, e.g. `R1` (free text); meant to match the
     /// search log's labels.
     pub round: Option<String>,
+    /// The paper's alias, e.g. the review's study ID `P18`: letters,
+    /// digits, `_`, `.` and `-`, held by no other paper as an alias or
+    /// citation key. Omitted, an earlier exclusion's alias is kept; `""`
+    /// clears it.
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UnexcludeParams {
     /// The exclusion's key (as `exclude` returns it, or as `add`'s refusal
-    /// names it), a DOI, or a provider reference from `search`.
+    /// names it), its alias, a DOI, or a provider reference from `search`.
     pub reference: String,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct EditParams {
-    /// The citation key of a paper in the library.
+    /// The citation key or alias of a paper in the library.
     pub reference: String,
     /// Tags to add; one the paper already has isn't repeated.
     #[serde(default)]
@@ -223,6 +232,10 @@ pub struct EditParams {
     pub remove_tags: Vec<String>,
     /// Replaces the paper's notes.
     pub notes: Option<String>,
+    /// Sets the paper's alias, e.g. the review's study ID `P17`: letters,
+    /// digits, `_`, `.` and `-`, held by no other paper as an alias or
+    /// citation key. `""` clears it.
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -245,7 +258,8 @@ pub enum ExportFormat {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExportParams {
     pub format: ExportFormat,
-    /// Export only these citation keys; every one must be in the library.
+    /// Export only these papers, by citation key or alias; every one must be
+    /// in the library.
     /// Without `keys` or `tag`, the whole library is exported.
     pub keys: Option<Vec<String>>,
     /// Export only papers with this exact tag (combined with `keys` by AND).
@@ -391,7 +405,7 @@ pub struct SeedReport {
     /// `related`, whether no provider's list is missing.
     pub complete: bool,
     /// Set when the seed itself is invalid (a malformed reference, or a
-    /// citation key not in the library); no provider was asked for it, and
+    /// name not in the library); no provider was asked for it, and
     /// the other seeds still answer.
     pub error: Option<String>,
 }
@@ -420,6 +434,9 @@ pub struct CitationResults {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DeclaredPaper {
     pub citation_key: String,
+    /// The paper's alias (e.g. the review's study ID `P17`), accepted
+    /// wherever its citation key is, when it has one.
+    pub alias: Option<String>,
     pub title: String,
     pub authors: Vec<String>,
     pub year: Option<i32>,
@@ -487,6 +504,10 @@ pub struct Excluded {
     pub criterion: Option<String>,
     /// The screening round, when recorded.
     pub round: Option<String>,
+    /// The paper's alias (e.g. the review's study ID `P18`), when it has
+    /// one. `show`, `refs`, `cited_by`, `related` and `unexclude` accept
+    /// it.
+    pub alias: Option<String>,
 }
 
 /// A library's PRISMA 2020 flow-diagram counts, computed by pax-core from
@@ -799,7 +820,9 @@ impl PaxServer {
     }
 
     /// Show one paper: by a provider reference from `search` (resolved live),
-    /// the citation key of a paper already in the library, or a DOI. A DOI is
+    /// the citation key or alias of a paper already in the library, or a
+    /// DOI. An excluded paper's alias returns its exclusion record
+    /// (`excluded`), read from the library like a citation key. A DOI is
     /// looked up at every provider that resolves DOIs, and their records come
     /// back merged as in `search`, flagged if in the library or excluded.
     /// DOI lookups aren't recorded in the search log.
@@ -878,7 +901,10 @@ impl PaxServer {
     /// with a reason and a stage (`screening` or `full-text`), and optionally
     /// the protocol's `criterion`, the screening `round` and the paper's
     /// `year`, replacing any earlier exclusion of it (so a criterion or round
-    /// not given again is cleared). Excluded papers are flagged in `search`,
+    /// not given again is cleared). An `alias` (e.g. the review's study ID)
+    /// names the excluded paper in `show`, `refs`, `cited_by`, `related` and
+    /// `unexclude`; unlike the criterion and round, one not given again is
+    /// kept, and `""` clears it. Excluded papers are flagged in `search`,
     /// `refs`, and `cited_by` results. A paper declared in the library is
     /// refused; it must be removed first. `add` refuses an excluded paper
     /// until `unexclude` reverses the decision.
@@ -891,20 +917,22 @@ impl PaxServer {
             .with_title(params.title)
             .with_year(params.year)
             .with_criterion(params.criterion)
-            .with_round(params.round);
+            .with_round(params.round)
+            .with_alias(params.alias);
         let exclusion =
             pax_core::exclude_paper_with(&params.reference, &options, &self.root, &self.config)
                 .await
                 .map_err(|e| match e {
                     PaxError::ExclusionTitleUnresolved(..) => format!("{e} with `title`"),
-                    other => other.to_string(),
+                    other => name_error(other),
                 })?;
         Ok(Json(excluded(exclusion)))
     }
 
     /// Reverse a recorded screening decision: remove the paper's exclusion
     /// from research/excluded.nix, so `add` accepts it again. Returns the
-    /// removed entry. Excluding was the reviewer's decision, so only undo it
+    /// removed entry, with the alias it freed: give it back with `edit` once
+    /// the paper is added. Excluding was the reviewer's decision, so only undo it
     /// when the reviewer asked to, not to get past `add`'s refusal. A paper
     /// with no matching exclusion is refused.
     #[tool]
@@ -918,19 +946,32 @@ impl PaxServer {
         Ok(Json(excluded(exclusion)))
     }
 
-    /// Edit a declared paper's tags and notes (e.g. tag it with a review's
-    /// screening decision). Returns the paper as it is after the edit.
+    /// Edit a declared paper's tags, notes and alias (e.g. tag it with a
+    /// review's screening decision, or give it the review's study ID `P17`,
+    /// which every tool then accepts in place of its citation key). An alias
+    /// another paper already holds, as an alias or a citation key, is
+    /// refused. Returns the paper as it is after the edit.
     #[tool]
     async fn edit(
         &self,
         Parameters(params): Parameters<EditParams>,
     ) -> Result<Json<DeclaredPaper>, String> {
         let path = self.papers_path()?;
-        let edits = paper_edits(params.add_tags, params.remove_tags, params.notes)?;
-        pax_core::edit_paper(&params.reference, &self.root, &edits).map_err(|e| e.to_string())?;
+        let edits = paper_edits(
+            params.add_tags,
+            params.remove_tags,
+            params.notes,
+            params.alias,
+        )?;
+        // Resolved before the edit, which may change the alias it was named by.
+        let key = Library::load(&path)
+            .ok()
+            .and_then(|library| citation_key(&library, &params.reference))
+            .unwrap_or_else(|| params.reference.clone());
+        pax_core::edit_paper(&params.reference, &self.root, &edits).map_err(name_error)?;
         let library = Library::load(&path).map_err(|e| e.to_string())?;
         let paper = library
-            .find(&params.reference)
+            .find(&key)
             .ok_or_else(|| format!("{:?} disappeared after the edit", params.reference))?;
         Ok(Json(declared(paper)))
     }
@@ -973,7 +1014,8 @@ impl PaxServer {
     }
 
     /// Export declared papers as BibTeX text: the whole library, or only the
-    /// given citation `keys` and/or the papers with a `tag`. Returns the text
+    /// papers named in `keys` (citation keys or aliases) and/or the papers
+    /// with a `tag`. Returns the text
     /// instead of writing a file.
     #[tool]
     async fn export(
@@ -1019,20 +1061,27 @@ impl PaxServer {
     /// store and returns the path. Can take minutes; it gives up after a
     /// timeout. A paper that can't be fetched (no source URL, download or
     /// build failure, hash mismatch) is reported in `status` and `reason`,
-    /// not as an error.
+    /// not as an error. An excluded paper's alias is refused: it isn't in the
+    /// library.
     #[tool]
     async fn fetch(
         &self,
         Parameters(params): Parameters<CitationKeyParams>,
     ) -> Result<Json<FetchResult>, String> {
-        self.papers_path()?;
-        let (key, root) = (params.reference.clone(), self.root.clone());
+        let path = self.papers_path()?;
+        // An alias is reported as the citation key it names; an unknown name
+        // is left to pax-core to refuse.
+        let citation_key = Library::load(&path)
+            .ok()
+            .and_then(|library| citation_key(&library, &params.reference))
+            .unwrap_or(params.reference);
+        let (key, root) = (citation_key.clone(), self.root.clone());
         let attempt =
             blocking_with_timeout(FETCH_TIMEOUT, move || fetch_and_build(&key, &root)).await?;
         let result = match attempt {
-            Some(attempt) => fetch_result(&params.reference, attempt)?,
+            Some(attempt) => fetch_result(&citation_key, attempt)?,
             None => FetchResult {
-                citation_key: params.reference,
+                citation_key,
                 status: FetchState::TimedOut,
                 hash: None,
                 store_path: None,
@@ -1115,6 +1164,11 @@ impl ServerHandler for PaxServer {
                  (fetch, which can take minutes), verify fetched PDFs still \
                  reproduce (check), list what's declared (list), export it as \
                  BibTeX text (export), and report PRISMA flow counts (stats). \
+                 A paper can carry an alias, such as the review's study ID \
+                 P17, set with edit (declared papers) or exclude (excluded \
+                 ones): every tool that takes a citation key also takes an \
+                 alias, and show, refs, cited_by, related and unexclude also \
+                 take an excluded paper's alias. \
                  Writes go to research/ through pax-core, and searches are \
                  recorded in research/search-log.jsonl, under a `label` when \
                  given, which stats counts by.",
@@ -1441,17 +1495,57 @@ fn excluded(exclusion: Exclusion) -> Excluded {
         year: exclusion.year,
         criterion: exclusion.criterion,
         round: exclusion.round,
+        alias: exclusion.alias,
     }
 }
 
-/// The tag and notes edits `edit` asks for. Blank tags are refused, since
-/// they'd be written into `papers.nix` as empty strings, and so is an edit
-/// with nothing in it (pax-core's own message for that names the CLI's
-/// flags).
+/// The citation key of the declared paper `name` names in `library`: its
+/// citation key or its alias, looked up in that order, as pax-core does.
+fn citation_key(library: &Library, name: &str) -> Option<String> {
+    library
+        .find(name)
+        .or_else(|| library.find_alias(name))
+        .map(|paper| paper.local.citation_key.clone())
+}
+
+/// Whether `name` is `paper`'s citation key or alias.
+fn is_named(paper: &Paper, name: &str) -> bool {
+    paper.local.citation_key == name || paper.local.alias.as_deref() == Some(name)
+}
+
+/// A pax-core error from a tool that takes or sets a library name, worded
+/// for the agent: a taken name says which paper holds it, and an excluded
+/// paper's alias given where a declared paper is needed says what takes it.
+fn name_error(e: PaxError) -> String {
+    match e {
+        PaxError::NameTaken { name, holder } => {
+            let holder = match holder {
+                NameHolder::Declared(key) => format!("the paper {key:?}"),
+                NameHolder::Excluded(key) => format!("the excluded paper {key:?}"),
+                other => other.to_string(),
+            };
+            format!(
+                "{name:?} is already taken by {holder}, as its alias or citation key; aliases \
+                 and citation keys share one namespace, so choose another"
+            )
+        }
+        PaxError::ExcludedNotDeclared { name, key } => format!(
+            "{name} names a paper excluded from the review (as {key:?}), not one in the \
+             library; show, refs, cited_by, related and unexclude take it"
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// The tag, notes and alias edits `edit` asks for. Blank tags are refused,
+/// since they'd be written into `papers.nix` as empty strings, and so is an
+/// edit with nothing in it (pax-core's own message for that names the CLI's
+/// flags). An empty `alias` clears the paper's alias.
 fn paper_edits(
     add_tags: Vec<String>,
     remove_tags: Vec<String>,
     notes: Option<String>,
+    alias: Option<String>,
 ) -> Result<PaperEdits, String> {
     if add_tags
         .iter()
@@ -1460,18 +1554,22 @@ fn paper_edits(
     {
         return Err("tags must not be blank".to_string());
     }
-    if add_tags.is_empty() && remove_tags.is_empty() && notes.is_none() {
-        return Err("nothing to edit: give `add_tags`, `remove_tags`, and/or `notes`".to_string());
+    if add_tags.is_empty() && remove_tags.is_empty() && notes.is_none() && alias.is_none() {
+        return Err(
+            "nothing to edit: give `add_tags`, `remove_tags`, `notes`, and/or `alias`".to_string(),
+        );
     }
     Ok(PaperEdits::new()
         .with_add_tags(add_tags)
         .with_remove_tags(remove_tags)
-        .with_notes(notes))
+        .with_notes(notes)
+        .with_alias(alias))
 }
 
 /// The papers `export` renders, in library order: those named in `keys`
-/// (when given) that carry `tag` (when given). A key that isn't in the
-/// library is an error rather than silently missing from the export.
+/// (by citation key or alias, when given) that carry `tag` (when given). A
+/// name that isn't in the library is an error rather than silently missing
+/// from the export.
 fn select_papers(
     papers: &[Paper],
     keys: Option<&[String]>,
@@ -1480,7 +1578,7 @@ fn select_papers(
     if let Some(keys) = keys {
         let unknown: Vec<&str> = keys
             .iter()
-            .filter(|key| !papers.iter().any(|p| &p.local.citation_key == *key))
+            .filter(|name| !papers.iter().any(|p| is_named(p, name)))
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
@@ -1493,7 +1591,7 @@ fn select_papers(
     };
     Ok(pax_core::filter_papers(papers, &filter)
         .into_iter()
-        .filter(|p| keys.is_none_or(|keys| keys.contains(&p.local.citation_key)))
+        .filter(|p| keys.is_none_or(|names| names.iter().any(|name| is_named(p, name))))
         .collect())
 }
 
@@ -1551,7 +1649,7 @@ fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult
         Err(e @ PaxError::Fetch(_)) => {
             return Ok(result(FetchState::FetchFailed, None, e.to_string()));
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(name_error(e)),
     };
     let (status, hash) = match outcome {
         FetchOutcome::Fetched { hash } => (FetchState::Fetched, hash),
@@ -1702,6 +1800,7 @@ fn criterion_counts(counts: Vec<pax_core::CriterionCount>) -> Vec<CriterionCount
 fn declared(paper: &Paper) -> DeclaredPaper {
     DeclaredPaper {
         citation_key: paper.local.citation_key.clone(),
+        alias: paper.local.alias.clone(),
         title: paper.identity.title.clone(),
         authors: paper.identity.authors.clone(),
         year: paper.identity.year,
@@ -2454,6 +2553,7 @@ mod tests {
             year: None,
             criterion: None,
             round: None,
+            alias: None,
         })
     }
 
@@ -3210,6 +3310,227 @@ mod tests {
                 .unwrap()
                 .contains("timed out")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn alias(reference: &str, alias: &str) -> Parameters<EditParams> {
+        Parameters(EditParams {
+            alias: Some(alias.to_string()),
+            ..edit_of(reference)
+        })
+    }
+
+    #[tokio::test]
+    async fn show_resolves_an_alias_without_the_network() {
+        let root = library_with_two_papers("show-alias");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(edited) = server.edit(alias("hewitt1973", "P17")).await.unwrap();
+        assert_eq!(edited.alias.as_deref(), Some("P17"));
+
+        let Json(shown) = server
+            .show(Parameters(ShowParams {
+                reference: Some("P17".to_string()),
+                ..ShowParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(shown.candidate.is_none() && shown.excluded.is_none());
+        let shown = shown.declared.unwrap();
+        assert_eq!(
+            (shown.citation_key.as_str(), shown.alias.as_deref()),
+            ("hewitt1973", Some("P17"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_tool_taking_a_citation_key_takes_an_alias() {
+        let root = library_with_two_papers("alias-tools");
+        let server = PaxServer::new(root.clone(), Config::default());
+        server.edit(alias("hewitt1973", "P17")).await.unwrap();
+
+        let Json(tagged) = server
+            .edit(Parameters(EditParams {
+                add_tags: vec!["included".to_string()],
+                ..edit_of("P17")
+            }))
+            .await
+            .unwrap();
+        assert_eq!(tagged.citation_key, "hewitt1973");
+        assert_eq!(tagged.tags, ["concurrency", "included"]);
+
+        let Json(fetched) = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "P17".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fetched.citation_key, "hewitt1973");
+        assert_eq!(fetched.status, FetchState::NoSourceUrl);
+
+        let Json(exported) = server
+            .export(Parameters(ExportParams {
+                format: ExportFormat::Bibtex,
+                keys: Some(vec!["P17".to_string()]),
+                tag: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(exported.citation_keys, ["hewitt1973"]);
+
+        let Json(refs) = server
+            .refs(Parameters(CitationParams {
+                reference: Some("P17".to_string()),
+                ..CitationParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(refs.seeds[0].error.is_none(), "{:?}", refs.seeds[0].error);
+
+        let Json(listed) = server
+            .list(Parameters(ListParams::default()))
+            .await
+            .unwrap();
+        let mut aliases: Vec<_> = listed
+            .papers
+            .iter()
+            .map(|p| (p.citation_key.as_str(), p.alias.as_deref()))
+            .collect();
+        aliases.sort();
+        assert_eq!(aliases, [("hewitt1973", Some("P17")), ("turing1936", None)]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_changes_an_alias_by_its_old_name_and_an_empty_one_clears_it() {
+        let root = library_with_two_papers("alias-change");
+        let server = PaxServer::new(root.clone(), Config::default());
+        server.edit(alias("hewitt1973", "P17")).await.unwrap();
+
+        let Json(renamed) = server.edit(alias("P17", "P18")).await.unwrap();
+        assert_eq!(
+            (renamed.citation_key.as_str(), renamed.alias.as_deref()),
+            ("hewitt1973", Some("P18"))
+        );
+        let Json(cleared) = server.edit(alias("P18", "")).await.unwrap();
+        assert_eq!(cleared.alias, None);
+        let library = Library::load(&pax_core::nix::papers_path(&root)).unwrap();
+        assert_eq!(library.find("hewitt1973").unwrap().local.alias, None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_alias_another_paper_holds_or_an_invalid_one_is_refused() {
+        let root = library_with_two_papers("alias-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        server.edit(alias("hewitt1973", "P17")).await.unwrap();
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let taken = server
+            .edit(alias("turing1936", "P17"))
+            .await
+            .err()
+            .expect("another paper's alias should be refused");
+        assert!(taken.contains("already taken"), "{taken}");
+        assert!(taken.contains("hewitt1973"), "{taken}");
+        let a_key = server
+            .edit(alias("turing1936", "hewitt1973"))
+            .await
+            .err()
+            .expect("another paper's citation key should be refused");
+        assert!(a_key.contains("already taken"), "{a_key}");
+        let invalid = server
+            .edit(alias("turing1936", "P 17"))
+            .await
+            .err()
+            .expect("an invalid alias should be refused");
+        assert!(invalid.contains("not a valid alias"), "{invalid}");
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        let Parameters(params) = exclusion("10.1000/x", "off topic", Some("X"));
+        let excluded = server
+            .exclude(Parameters(ExcludeParams {
+                alias: Some("P17".to_string()),
+                ..params
+            }))
+            .await
+            .err()
+            .expect("exclude should refuse a declared paper's alias");
+        assert!(excluded.contains("hewitt1973"), "{excluded}");
+        assert!(!pax_core::nix::excluded_path(&root).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_excluded_alias_shows_the_exclusion_and_is_refused_by_edit_and_fetch() {
+        let root = library_with_two_papers("alias-excluded");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let excluded_as = |alias: Option<&str>| {
+            let Parameters(params) = exclusion("10.1000/off-topic", "not empirical", Some("X"));
+            Parameters(ExcludeParams {
+                alias: alias.map(str::to_string),
+                ..params
+            })
+        };
+
+        let Json(excluded) = server.exclude(excluded_as(Some("P18"))).await.unwrap();
+        assert_eq!(excluded.alias.as_deref(), Some("P18"));
+        let Json(again) = server.exclude(excluded_as(None)).await.unwrap();
+        assert_eq!(
+            again.alias.as_deref(),
+            Some("P18"),
+            "an omitted alias is kept"
+        );
+
+        let Json(shown) = server
+            .show(Parameters(ShowParams {
+                reference: Some("P18".to_string()),
+                ..ShowParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(shown.declared.is_none() && shown.candidate.is_none());
+        let shown = shown.excluded.unwrap();
+        assert_eq!(
+            (shown.key.as_str(), shown.alias.as_deref()),
+            ("10.1000/off-topic", Some("P18"))
+        );
+
+        let edit = server
+            .edit(Parameters(EditParams {
+                notes: Some("x".to_string()),
+                ..edit_of("P18")
+            }))
+            .await
+            .err()
+            .expect("edit should refuse an excluded paper's alias");
+        assert!(edit.contains("excluded"), "{edit}");
+        let fetch = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "P18".to_string(),
+            }))
+            .await
+            .err()
+            .expect("fetch should refuse an excluded paper's alias");
+        assert!(fetch.contains("excluded"), "{fetch}");
+
+        let Json(cleared) = server.exclude(excluded_as(Some(""))).await.unwrap();
+        assert_eq!(cleared.alias, None);
+        let Json(_) = server.exclude(excluded_as(Some("P18"))).await.unwrap();
+        let Json(unexcluded) = server
+            .unexclude(Parameters(UnexcludeParams {
+                reference: "P18".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(unexcluded.alias.as_deref(), Some("P18"));
 
         fs::remove_dir_all(root).unwrap();
     }
