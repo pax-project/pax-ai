@@ -51,6 +51,11 @@ pub struct PagingParams {
     /// `R2-backward`, so `stats` can count each round apart (`by_label`).
     /// It doesn't change what is searched; a blank label is refused.
     pub label: Option<String>,
+    /// Include each merged paper's `abstract`, for title-and-abstract
+    /// screening without a `show` per paper. Makes the response several
+    /// times larger.
+    #[serde(default)]
+    pub with_abstracts: bool,
 }
 
 impl PagingParams {
@@ -81,7 +86,10 @@ impl PagingParams {
             }
             filters = filters.with_language(language);
         }
-        let options = defaults.with_limit(limit).with_filters(filters);
+        let options = defaults
+            .with_limit(limit)
+            .with_filters(filters)
+            .with_abstracts(self.with_abstracts);
         match &self.label {
             Some(label) if label.trim().is_empty() => {
                 Err("`label` must not be blank, e.g. `R2-backward`".to_string())
@@ -274,6 +282,12 @@ pub struct MergedHit {
     /// Every merged record's reference, representative (`id`) first; any of
     /// them works with `show` and `add`.
     pub ids: Vec<String>,
+    /// The paper's abstract: the first one among its records, taking
+    /// providers in the order OpenAlex, Crossref, Semantic Scholar, arXiv.
+    /// Only sent when `with_abstracts` was asked for; then null when no
+    /// record has one.
+    #[serde(rename = "abstract", skip_serializing_if = "Option::is_none")]
+    pub abstract_text: Option<Option<String>>,
     /// Kept by a language filter although no record carries a language to
     /// check it against.
     pub language_unknown: bool,
@@ -681,8 +695,9 @@ impl PaxServer {
     /// and language. Reports each provider's retrieved/total counts, then one
     /// list merged across providers, each paper flagged if it's already in
     /// the library or excluded. Any result `id` works with `show` and `add`.
-    /// The search is recorded in the library's search log, under `label`
-    /// when given.
+    /// `with_abstracts` adds each paper's `abstract`, making the response
+    /// several times larger. The search is recorded in the library's search
+    /// log, under `label` when given.
     #[tool]
     async fn search(
         &self,
@@ -699,7 +714,11 @@ impl PaxServer {
             }
             _ => return Err("give exactly one of `query` or `author`".to_string()),
         };
-        Ok(Json(self.results(logged, &PROVIDER_ORDER)))
+        Ok(Json(self.results(
+            logged,
+            &PROVIDER_ORDER,
+            options.abstracts,
+        )))
     }
 
     /// The papers one or more seed papers cite (backward snowballing), from
@@ -712,8 +731,10 @@ impl PaxServer {
     /// `failed`, or `unresolved` for a provider, that list is missing: take
     /// the paper's references from its own reference list (its
     /// bibliography) instead. `truncated` only means `limit` stopped
-    /// retrieval; ask again with a higher `limit` or `all`. Recorded in the
-    /// library's search log, under `label` when given.
+    /// retrieval; ask again with a higher `limit` or `all`.
+    /// `with_abstracts` adds each paper's `abstract`, making the response
+    /// several times larger. Recorded in the library's search log, under
+    /// `label` when given.
     #[tool]
     async fn refs(
         &self,
@@ -723,12 +744,13 @@ impl PaxServer {
         let seeds = params.seeds()?;
         let logged =
             pax_core::references_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged).map(Json)
+        self.citations(logged, options.abstracts).map(Json)
     }
 
     /// The papers citing one or more seed papers (forward snowballing);
-    /// otherwise as `refs`. A paper's own text can't list what cites it, so
-    /// a missing list here has no fallback but the other provider's.
+    /// otherwise as `refs`, `with_abstracts` included (responses several
+    /// times larger). A paper's own text can't list what cites it, so a
+    /// missing list here has no fallback but the other provider's.
     #[tool]
     async fn cited_by(
         &self,
@@ -738,7 +760,7 @@ impl PaxServer {
         let seeds = params.seeds()?;
         let logged =
             pax_core::cited_by_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged).map(Json)
+        self.citations(logged, options.abstracts).map(Json)
     }
 
     /// Show one paper: by a provider reference from `search` (resolved live),
@@ -995,22 +1017,27 @@ impl PaxServer {
         Ok(path)
     }
 
-    /// A logged search's or citation lookup's results, flagged against the
-    /// library as it is now.
+    /// A logged search's results, flagged against the library as it is now,
+    /// with each paper's abstract when `abstracts` were asked for.
     fn results<E: Display>(
         &self,
         logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
         providers: &[ProviderId],
+        abstracts: bool,
     ) -> SearchResults {
         let Logged { results, log, .. } = logged;
         let index = LibraryIndex::load(&self.root);
-        search_results(&results, providers, &index, log)
+        search_results(&results, providers, &index, log, abstracts)
     }
 
     /// A logged multi-seed citation lookup's results, flagged against the
     /// library as it is now. When no seed was valid, no provider was asked
     /// and nothing was logged, so it's an error naming each seed's problem.
-    fn citations(&self, logged: Logged<SeedResults>) -> Result<CitationResults, String> {
+    fn citations(
+        &self,
+        logged: Logged<SeedResults>,
+        abstracts: bool,
+    ) -> Result<CitationResults, String> {
         let Logged { results, log, .. } = logged;
         let invalid: Vec<String> = results
             .seeds
@@ -1021,7 +1048,7 @@ impl PaxServer {
             return Err(invalid.join("; "));
         }
         let index = LibraryIndex::load(&self.root);
-        Ok(citation_results(&results, &index, log))
+        Ok(citation_results(&results, &index, log, abstracts))
     }
 }
 
@@ -1032,8 +1059,9 @@ impl ServerHandler for PaxServer {
             .with_server_info(Implementation::new("pax-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Tools over a pax research library: search providers for papers \
-                 (search), follow papers' references and citations (refs, \
-                 cited_by), show one by reference, citation key, or DOI (show), \
+                 (search, with abstracts on request), follow papers' \
+                 references and citations (refs, cited_by), show one by \
+                 reference, citation key, or DOI (show), \
                  add it to the library (add) or exclude it with a reason and \
                  the protocol's criterion (exclude, and unexclude to reverse \
                  an exclusion the reviewer reconsiders), tag and annotate \
@@ -1049,12 +1077,14 @@ impl ServerHandler for PaxServer {
 }
 
 /// Per-provider reports, in `providers` order, and the successful pages
-/// merged into one list flagged against `index`.
+/// merged into one list flagged against `index`, with each paper's abstract
+/// when `abstracts` were asked for.
 fn search_results<E: Display>(
     results: &HashMap<ProviderId, Result<SearchPage, E>>,
     providers: &[ProviderId],
     index: &LibraryIndex,
     log: LogOutcome,
+    abstracts: bool,
 ) -> SearchResults {
     let reports = providers
         .iter()
@@ -1070,7 +1100,7 @@ fn search_results<E: Display>(
     let hits = merged
         .works
         .iter()
-        .map(|merged| merged_hit(merged, index, &language_unknown))
+        .map(|merged| merged_hit(merged, index, &language_unknown, abstracts))
         .collect();
     SearchResults {
         providers: reports,
@@ -1086,11 +1116,13 @@ fn search_results<E: Display>(
 }
 
 /// Each seed's report, and pax-core's list merged across every seed and
-/// provider, flagged against `index`.
+/// provider, flagged against `index`, with each paper's abstract when
+/// `abstracts` were asked for.
 fn citation_results(
     results: &SeedResults,
     index: &LibraryIndex,
     log: LogOutcome,
+    abstracts: bool,
 ) -> CitationResults {
     let seed_name = |i: usize| results.seeds[i].seed.clone();
     let seeds: Vec<SeedReport> = results
@@ -1124,7 +1156,7 @@ fn citation_results(
                 }
             }
             CitationHit {
-                hit: merged_hit(&work.merged, index, &language_unknown),
+                hit: merged_hit(&work.merged, index, &language_unknown, abstracts),
                 seeds,
             }
         })
@@ -1184,10 +1216,12 @@ fn seed_report(
 
 /// One merged paper, flagged against `index`; `language_unknown` tells
 /// whether a language filter kept a record without a language to check.
+/// With `abstracts`, it carries pax-core's pick of the group's abstract.
 fn merged_hit(
     merged: &MergedWork,
     index: &LibraryIndex,
     language_unknown: &impl Fn(&CandidateWork) -> bool,
+    abstracts: bool,
 ) -> MergedHit {
     MergedHit {
         work: candidate(
@@ -1198,6 +1232,7 @@ fn merged_hit(
         providers: merged.providers().iter().map(ToString::to_string).collect(),
         ids: merged.ids().iter().map(ToString::to_string).collect(),
         language_unknown: merged.records().all(language_unknown),
+        abstract_text: abstracts.then(|| merged.abstract_text().map(str::to_string)),
     }
 }
 
@@ -1235,7 +1270,7 @@ fn doi_records(
         results: merged
             .works
             .iter()
-            .map(|merged| merged_hit(merged, index, &|_: &CandidateWork| false))
+            .map(|merged| merged_hit(merged, index, &|_: &CandidateWork| false, false))
             .collect(),
     }
 }
@@ -1797,10 +1832,12 @@ mod tests {
             "type": "journal-article",
             "language": "EN",
             "label": " R2-backward ",
+            "with_abstracts": true,
         }))
         .unwrap();
         let options = params.paging.options().unwrap();
         assert_eq!(options.label.as_deref(), Some("R2-backward"));
+        assert!(options.abstracts);
         assert_eq!(options.limit, Limit::Count(10));
         assert_eq!(
             options.filters.years,
@@ -1915,7 +1952,13 @@ mod tests {
             ),
         ]);
 
-        let out = search_results(&results, &PROVIDER_ORDER, &index, LogOutcome::NoLibrary);
+        let out = search_results(
+            &results,
+            &PROVIDER_ORDER,
+            &index,
+            LogOutcome::NoLibrary,
+            false,
+        );
 
         let providers: Vec<_> = out
             .providers
@@ -1982,6 +2025,7 @@ mod tests {
             &PROVIDER_ORDER,
             &LibraryIndex::default(),
             LogOutcome::Written(PathBuf::from("research/search-log.jsonl")),
+            false,
         );
 
         let report = &out.providers[0];
@@ -1998,6 +2042,70 @@ mod tests {
         assert!(out.results[0].language_unknown);
         assert!(out.log.logged);
         assert_eq!(out.log.path.as_deref(), Some("research/search-log.jsonl"));
+    }
+
+    #[test]
+    fn abstracts_are_sent_only_when_asked_for() {
+        let turing = "10.1112/plms/s2-42.1.230";
+        let openalex = CandidateWork {
+            abstract_text: Some("From OpenAlex".to_string()),
+            ..work(
+                ProviderId::OpenAlex,
+                "W1",
+                "On Computable Numbers",
+                Some(turing),
+            )
+        };
+        let crossref = CandidateWork {
+            abstract_text: Some("From Crossref".to_string()),
+            ..work(
+                ProviderId::Crossref,
+                turing,
+                "On Computable Numbers",
+                Some(turing),
+            )
+        };
+        let none = work(ProviderId::Crossref, "10.1000/a", "A", Some("10.1000/a"));
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> = HashMap::from([
+            (
+                ProviderId::OpenAlex,
+                Ok(SearchPage::new(vec![openalex], Some(1), None)),
+            ),
+            (
+                ProviderId::Crossref,
+                Ok(SearchPage::new(vec![crossref, none], Some(2), None)),
+            ),
+        ]);
+        let out = |abstracts| {
+            search_results(
+                &results,
+                &PROVIDER_ORDER,
+                &LibraryIndex::default(),
+                LogOutcome::NoLibrary,
+                abstracts,
+            )
+        };
+
+        let asked = serde_json::to_value(out(true)).unwrap();
+        // Whichever record represents the paper, the abstract is taken in
+        // pax-core's provider order: OpenAlex before Crossref.
+        assert_eq!(
+            asked["results"][0]["providers"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(asked["results"][0]["abstract"], "From OpenAlex");
+        assert!(asked["results"][1]["abstract"].is_null());
+        assert!(
+            asked["results"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("abstract")
+        );
+
+        let unasked = serde_json::to_value(out(false)).unwrap();
+        for hit in unasked["results"].as_array().unwrap() {
+            assert!(!hit.as_object().unwrap().contains_key("abstract"), "{hit}");
+        }
     }
 
     #[test]
