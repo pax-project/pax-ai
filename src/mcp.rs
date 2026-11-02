@@ -842,8 +842,9 @@ impl PaxServer {
     /// removed, records screened, exclusions at each stage (full-text ones
     /// by reason, both stages by criterion), papers still awaiting a
     /// screening decision, reports sought (papers that passed screening),
-    /// reports not retrieved, and papers included. Mid-round, report `awaiting_screening` as still to screen,
-    /// not as passed. Computed from the library's files; nothing is written.
+    /// reports not retrieved, and papers included. Mid-round, report
+    /// `awaiting_screening` as still to screen, not as passed. Computed from
+    /// the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
         self.papers_path()?;
@@ -1002,12 +1003,13 @@ impl ServerHandler for PaxServer {
                  cited_by), show one by reference, citation key, or DOI (show), \
                  add it to the library (add) or exclude it with a reason and \
                  the protocol's criterion (exclude, and unexclude to reverse \
-                 an exclusion the reviewer reconsiders), tag and annotate declared papers (edit), fetch a \
-                 paper's PDF through Nix (fetch, which can take minutes), verify \
-                 fetched PDFs still reproduce (check), list what's declared \
-                 (list), export it as BibTeX text (export), and report PRISMA \
-                 flow counts (stats). Writes go to research/ through pax-core, \
-                 and searches are recorded in research/search-log.jsonl.",
+                 an exclusion the reviewer reconsiders), tag and annotate \
+                 declared papers (edit), fetch a paper's PDF through Nix \
+                 (fetch, which can take minutes), verify fetched PDFs still \
+                 reproduce (check), list what's declared (list), export it as \
+                 BibTeX text (export), and report PRISMA flow counts (stats). \
+                 Writes go to research/ through pax-core, and searches are \
+                 recorded in research/search-log.jsonl.",
             )
     }
 }
