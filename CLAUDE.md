@@ -43,7 +43,7 @@ cargo clippy  # lint
 
 crates.io dependency on the published `pax-core-papers` package, aliased back to `pax-core` (its lib name is still `pax_core`), `default-features = false` (the `cli` feature — and its `clap`/`dotenvy`/`tokio` deps — stays off), same as `lazy-pax`. Moving to a later `pax-core` release is a deliberate, explicit step, not automatic.
 
-pax-core 2.0's enums and several of its structs are `#[non_exhaustive]`: matches on them need a wildcard arm, and its structs are built with `new`/`with_*`, not literals.
+pax-core's enums and several of its structs (since 3.0 also `Local` and `PaperEdits`) are `#[non_exhaustive]`: matches on them need a wildcard arm, and its structs are built with `new`/`with_*`, not literals.
 
 ## MCP server notes
 
@@ -51,5 +51,6 @@ pax-core 2.0's enums and several of its structs are `#[non_exhaustive]`: matches
 - `search`, `refs`, `cited_by`, and `related` call pax-core's `*_logged` variants (`references_many_logged`/`cited_by_many_logged`/`related_many_logged` for the seed tools, even for one seed), so an agent's searches land in `research/search-log.jsonl` with the CLI's; the result's `log` says when nothing was logged (no library, or the write failed). Never call the unlogged `search_*`/`references`/`cited_by`/`related` from a tool.
 - `show { doi }` calls the unlogged `search_by_doi` (pax-core has no logged variant): it's a lookup of a known paper, not a search for PRISMA's identified count.
 - `fetch` and `check` shell out to `nix`, so they run on tokio's blocking pool (`spawn_blocking`); `fetch` also has an overall timeout. A paper that can't be fetched is a `FetchResult` status with a reason, not a tool error.
+- A library name is a citation key or an alias (pax-core's "Aliases": one namespace across `papers.nix` and `excluded.nix`, looked up as a citation key first). Tools that take a citation key pass the name straight to pax-core, which resolves it; `show` on an excluded paper's alias returns `ShowOutput::excluded`, and `edit`/`fetch` get `PaxError::ExcludedNotDeclared` for one. Where a tool needs the citation key itself (`edit` re-reading the paper after an alias change, `fetch` labelling its result), `citation_key` resolves it the same way; `export` matches `keys` with `is_named`. `name_error` words `NameTaken`/`ExcludedNotDeclared` for the agent.
 - In-library/excluded flags come from `LibraryIndex`, which matches by DOI or arXiv id; don't use the deprecated `known_dois`/`excluded_keys`.
 - Tests use a fixture library in a temp dir and no network: tools that need a provider are tested on argument validation and on the conversion functions with hand-built `SearchPage`s. pax-core's `SeedResult`/`SeedResults` can't be built outside it, so `seed_report` takes a seed's parts (a hand-built `CitationResults` map) and the multi-seed tools are otherwise tested with seeds that resolve offline (a declared paper with no DOI or arXiv id, an unknown citation key).
