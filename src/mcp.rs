@@ -11,13 +11,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pax_core::merge::PROVIDER_ORDER;
 use pax_core::{
-    CITATION_PROVIDERS, CandidateId, CandidateWork, Config, DocType, Exclusion, ExclusionStage,
-    Filters, LibraryIndex, Limit, ListFilter, LogOutcome, Logged, MergedWork, Paper, PaxError,
-    ProviderId, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
+    CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
+    Exclusion, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter,
+    LogOutcome, Logged, MergedWork, Paper, PaperEdits, PaxError, ProviderError, ProviderId,
+    ResolvedArtifact, SearchOptions, SearchPage, SeedResults, ShowResult, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -117,8 +119,25 @@ impl CitationParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReferenceParams {
-    /// A provider reference from `search` (e.g. `openalex:W2072794470`), or
-    /// for `show` also a citation key already in the library.
+    /// A provider reference from `search`, e.g. `openalex:W2072794470`.
+    pub reference: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ShowParams {
+    /// A provider reference from `search` (e.g. `openalex:W2072794470`) or the
+    /// citation key of a paper in the library. Give exactly one of
+    /// `reference` or `doi`.
+    pub reference: Option<String>,
+    /// A DOI (bare or `https://doi.org/...`), looked up at every provider
+    /// that resolves DOIs, since one DOI can match several providers'
+    /// records.
+    pub doi: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CitationKeyParams {
+    /// The citation key of a paper in the library, e.g. `turing1936`.
     pub reference: String,
 }
 
@@ -162,12 +181,44 @@ pub struct UnexcludeParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct EditParams {
+    /// The citation key of a paper in the library.
+    pub reference: String,
+    /// Tags to add; one the paper already has isn't repeated.
+    #[serde(default)]
+    pub add_tags: Vec<String>,
+    /// Tags to remove, applied after `add_tags` (so a tag in both ends up
+    /// removed).
+    #[serde(default)]
+    pub remove_tags: Vec<String>,
+    /// Replaces the paper's notes.
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListParams {
     /// Case-insensitive substring of an author's name.
     pub author: Option<String>,
     /// Publication year.
     pub year: Option<i32>,
     /// Exact tag.
+    pub tag: Option<String>,
+}
+
+/// The text format `export` renders.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Bibtex,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportParams {
+    pub format: ExportFormat,
+    /// Export only these citation keys; every one must be in the library.
+    /// Without `keys` or `tag`, the whole library is exported.
+    pub keys: Option<Vec<String>>,
+    /// Export only papers with this exact tag (combined with `keys` by AND).
     pub tag: Option<String>,
 }
 
@@ -342,12 +393,35 @@ pub struct DeclaredPaper {
     pub fetched: bool,
 }
 
-/// Exactly one of the two fields is set, depending on whether the reference
-/// named a declared paper (citation key) or a provider candidate.
+/// What one provider returned for a DOI.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DoiLookup {
+    pub provider: String,
+    /// Whether the provider has a record for the DOI.
+    pub found: bool,
+    /// Set when the lookup failed (not when the provider just has no
+    /// record); the other providers' records still stand.
+    pub error: Option<String>,
+}
+
+/// Every provider's record of a DOI, merged as `search` merges results.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DoiRecords {
+    /// The DOI looked up, normalized.
+    pub doi: String,
+    /// The providers that resolve DOIs (arXiv doesn't).
+    pub providers: Vec<DoiLookup>,
+    /// Normally one paper; more if the providers' records don't merge.
+    pub results: Vec<MergedHit>,
+}
+
+/// Exactly one field is set: `declared` for a citation key, `candidate` for
+/// a provider reference, `records` for a DOI.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ShowOutput {
     pub declared: Option<DeclaredPaper>,
     pub candidate: Option<Candidate>,
+    pub records: Option<DoiRecords>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -428,6 +502,92 @@ pub struct ReasonCount {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PaperList {
     pub papers: Vec<DeclaredPaper>,
+}
+
+/// Selected papers rendered as text; nothing is written, so the client
+/// decides where it goes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Exported {
+    pub format: ExportFormat,
+    /// The exported papers, in library order.
+    pub citation_keys: Vec<String>,
+    /// Empty when nothing matched.
+    pub text: String,
+}
+
+/// Where one paper's artifact stands, as `pax check` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckState {
+    /// No hash recorded yet (or no `source_url` to check it against); `fetch`
+    /// hasn't run for it.
+    NotFetched,
+    /// The source still resolves to the recorded hash.
+    Reproducible,
+    /// The source now resolves to different content than recorded.
+    Mismatch,
+    /// The source couldn't be resolved (network failure, 404, ...).
+    Error,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PaperCheck {
+    pub citation_key: String,
+    pub status: CheckState,
+    /// The recorded hash, on a mismatch.
+    pub expected: Option<String>,
+    /// The hash the source resolves to now, on a mismatch.
+    pub actual: Option<String>,
+    /// Why the source couldn't be resolved, on an error.
+    pub error: Option<String>,
+}
+
+/// One report per declared paper, then the totals `pax check` prints.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CheckResults {
+    pub papers: Vec<PaperCheck>,
+    pub checked: usize,
+    pub reproducible: usize,
+    pub not_fetched: usize,
+    pub mismatched: usize,
+    pub errored: usize,
+}
+
+/// How a `fetch` ended. Only `fetched` and `already-fetched` have a
+/// `store_path`; every other state says in `reason` what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum FetchState {
+    /// Downloaded now: its hash is recorded in `papers.nix` and the PDF is in
+    /// the Nix store.
+    Fetched,
+    /// Its hash was already recorded; the PDF is in the Nix store.
+    AlreadyFetched,
+    /// No `source_url` is recorded (the provider found no open-access copy),
+    /// so there's nothing to download.
+    NoSourceUrl,
+    /// Downloading failed (network error, 404, `nix` failure); nothing was
+    /// recorded.
+    FetchFailed,
+    /// The source no longer matches the recorded hash.
+    HashMismatch,
+    /// The hash is recorded, but `nix build` couldn't produce the PDF.
+    BuildFailed,
+    /// `nix` didn't finish in time; the hash may still be recorded once it
+    /// does.
+    TimedOut,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FetchResult {
+    pub citation_key: String,
+    pub status: FetchState,
+    /// The recorded Nix hash, when there is one.
+    pub hash: Option<String>,
+    /// The PDF's Nix store path.
+    pub store_path: Option<String>,
+    /// Why there's no store path, and what to do about it.
+    pub reason: Option<String>,
 }
 
 /// Serves one research library: `root` is the directory containing
@@ -513,20 +673,38 @@ impl PaxServer {
         self.citations(logged).map(Json)
     }
 
-    /// Show one paper: a provider reference from `search` (resolved live), or
-    /// the citation key of a paper already in the library.
+    /// Show one paper: by a provider reference from `search` (resolved live),
+    /// the citation key of a paper already in the library, or a DOI. A DOI is
+    /// looked up at every provider that resolves DOIs, and their records come
+    /// back merged as in `search`, flagged if in the library or excluded.
+    /// DOI lookups aren't recorded in the search log.
     #[tool]
     async fn show(
         &self,
-        Parameters(params): Parameters<ReferenceParams>,
+        Parameters(params): Parameters<ShowParams>,
     ) -> Result<Json<ShowOutput>, String> {
-        let shown = pax_core::show_reference(&params.reference, &self.root, &self.config)
+        let reference = match (params.reference, params.doi) {
+            (Some(reference), None) => reference,
+            (None, Some(doi)) => {
+                let doi = doi_param(&doi)?;
+                let results = pax_core::search_by_doi(&doi, &self.config).await;
+                let index = LibraryIndex::load(&self.root);
+                return Ok(Json(ShowOutput {
+                    declared: None,
+                    candidate: None,
+                    records: Some(doi_records(doi, &results, &index)),
+                }));
+            }
+            _ => return Err("give exactly one of `reference` or `doi`".to_string()),
+        };
+        let shown = pax_core::show_reference(&reference, &self.root, &self.config)
             .await
             .map_err(|e| e.to_string())?;
         Ok(Json(match shown {
             ShowResult::Declared(paper) => ShowOutput {
                 declared: Some(declared(&paper)),
                 candidate: None,
+                records: None,
             },
             ShowResult::Candidate(work) => {
                 let index = LibraryIndex::load(&self.root);
@@ -537,6 +715,7 @@ impl PaxServer {
                         index.contains(&work),
                         index.is_excluded(&work),
                     )),
+                    records: None,
                 }
             }
         }))
@@ -604,6 +783,23 @@ impl PaxServer {
         Ok(Json(excluded(exclusion)))
     }
 
+    /// Edit a declared paper's tags and notes (e.g. tag it with a review's
+    /// screening decision). Returns the paper as it is after the edit.
+    #[tool]
+    async fn edit(
+        &self,
+        Parameters(params): Parameters<EditParams>,
+    ) -> Result<Json<DeclaredPaper>, String> {
+        let path = self.papers_path()?;
+        let edits = paper_edits(params.add_tags, params.remove_tags, params.notes)?;
+        pax_core::edit_paper(&params.reference, &self.root, &edits).map_err(|e| e.to_string())?;
+        let library = Library::load(&path).map_err(|e| e.to_string())?;
+        let paper = library
+            .find(&params.reference)
+            .ok_or_else(|| format!("{:?} disappeared after the edit", params.reference))?;
+        Ok(Json(declared(paper)))
+    }
+
     /// The review's PRISMA 2020 flow-diagram counts: records identified per
     /// provider (database searches and citation searching), duplicates
     /// removed, records screened, exclusions at each stage (full-text ones
@@ -613,12 +809,7 @@ impl PaxServer {
     /// not as passed. Computed from the library's files; nothing is written.
     #[tool]
     async fn stats(&self) -> Result<Json<PrismaStats>, String> {
-        if !pax_core::nix::papers_path(&self.root).exists() {
-            return Err(format!(
-                "no pax library at {} (research/papers.nix not found)",
-                self.root.display()
-            ));
-        }
+        self.papers_path()?;
         let stats = pax_core::stats(&self.root).map_err(|e| e.to_string())?;
         Ok(Json(prisma_stats(stats)))
     }
@@ -643,11 +834,98 @@ impl PaxServer {
             .collect();
         Ok(Json(PaperList { papers }))
     }
+
+    /// Export declared papers as BibTeX text: the whole library, or only the
+    /// given citation `keys` and/or the papers with a `tag`. Returns the text
+    /// instead of writing a file.
+    #[tool]
+    async fn export(
+        &self,
+        Parameters(params): Parameters<ExportParams>,
+    ) -> Result<Json<Exported>, String> {
+        let library = Library::load(&self.papers_path()?).map_err(|e| e.to_string())?;
+        let papers = select_papers(
+            library.papers(),
+            params.keys.as_deref(),
+            params.tag.as_deref(),
+        )?;
+        let text = match params.format {
+            ExportFormat::Bibtex => pax_core::bibtex::render(&papers),
+        };
+        Ok(Json(Exported {
+            format: params.format,
+            citation_keys: papers
+                .iter()
+                .map(|p| p.local.citation_key.clone())
+                .collect(),
+            text,
+        }))
+    }
+
+    /// Verify every fetched paper's PDF still reproduces from its recorded
+    /// hash (one `nix store prefetch-file` per paper, so it needs the
+    /// network), without writing anything. Papers not fetched yet are
+    /// reported as such; one paper's failure doesn't stop the rest.
+    #[tool]
+    async fn check(&self) -> Result<Json<CheckResults>, String> {
+        self.papers_path()?;
+        let root = self.root.clone();
+        let reports = tokio::task::spawn_blocking(move || pax_core::check_library(&root))
+            .await
+            .map_err(|e| format!("check didn't finish: {e}"))?
+            .map_err(|e| e.to_string())?;
+        Ok(Json(check_results(reports)))
+    }
+
+    /// Download a declared paper's PDF through Nix: records its hash in
+    /// `papers.nix` (unless already recorded), then builds it into the Nix
+    /// store and returns the path. Can take minutes; it gives up after a
+    /// timeout. A paper that can't be fetched (no source URL, download or
+    /// build failure, hash mismatch) is reported in `status` and `reason`,
+    /// not as an error.
+    #[tool]
+    async fn fetch(
+        &self,
+        Parameters(params): Parameters<CitationKeyParams>,
+    ) -> Result<Json<FetchResult>, String> {
+        self.papers_path()?;
+        let (key, root) = (params.reference.clone(), self.root.clone());
+        let attempt =
+            blocking_with_timeout(FETCH_TIMEOUT, move || fetch_and_build(&key, &root)).await?;
+        let result = match attempt {
+            Some(attempt) => fetch_result(&params.reference, attempt)?,
+            None => FetchResult {
+                citation_key: params.reference,
+                status: FetchState::TimedOut,
+                hash: None,
+                store_path: None,
+                reason: Some(format!(
+                    "nix didn't finish within {}s; it may still record the hash, so call \
+                     `fetch` again later",
+                    FETCH_TIMEOUT.as_secs()
+                )),
+            },
+        };
+        Ok(Json(result))
+    }
 }
 
 impl PaxServer {
-    /// A logged search's results, flagged against the library as it is
-    /// now.
+    /// The library's `research/papers.nix`, or a clear error when the root
+    /// has none.
+    fn papers_path(&self) -> Result<PathBuf, String> {
+        let path = pax_core::nix::papers_path(&self.root);
+        if !path.exists() {
+            return Err(format!(
+                "no pax library at {} (research/papers.nix not found)",
+                self.root.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    /// A logged search's or citation lookup's results, flagged against the
+    /// library as it is now.
     fn results<E: Display>(
         &self,
         logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
@@ -682,13 +960,17 @@ impl ServerHandler for PaxServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("pax-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Tools over a pax research library: search providers for papers, \
-                 follow papers' references and citations, show one, add it to \
-                 the library or exclude it with a reason (and reverse an \
-                 exclusion the reviewer reconsiders), list what's declared, \
-                 and report PRISMA flow counts. Writes go to research/ \
-                 through pax-core, and searches are recorded in \
-                 research/search-log.jsonl.",
+                "Tools over a pax research library: search providers for papers \
+                 (search), follow papers' references and citations (refs, \
+                 cited_by), show one by reference, citation key, or DOI (show), \
+                 add it to the library (add) or exclude it with a reason \
+                 (exclude, and unexclude to reverse an exclusion the reviewer \
+                 reconsiders), tag and annotate declared papers (edit), fetch a \
+                 paper's PDF through Nix (fetch, which can take minutes), verify \
+                 fetched PDFs still reproduce (check), list what's declared \
+                 (list), export it as BibTeX text (export), and report PRISMA \
+                 flow counts (stats). Writes go to research/ through pax-core, \
+                 and searches are recorded in research/search-log.jsonl.",
             )
     }
 }
@@ -846,6 +1128,60 @@ fn merged_hit(
     }
 }
 
+/// Every provider's answer for a DOI, in `PROVIDER_ORDER`, and the records
+/// found merged into one list flagged against `index`.
+fn doi_records(
+    doi: String,
+    results: &HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>>,
+    index: &LibraryIndex,
+) -> DoiRecords {
+    let providers = PROVIDER_ORDER
+        .iter()
+        .filter_map(|provider| {
+            let result = results.get(provider)?;
+            Some(DoiLookup {
+                provider: provider.to_string(),
+                found: result.as_ref().is_ok_and(|works| !works.is_empty()),
+                error: match result {
+                    Err(ProviderError::NotFound) | Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                },
+            })
+        })
+        .collect();
+    let merged = pax_core::merge_works(
+        PROVIDER_ORDER
+            .iter()
+            .filter_map(|provider| results.get(provider)?.as_ref().ok())
+            .flatten()
+            .cloned(),
+    );
+    DoiRecords {
+        doi,
+        providers,
+        results: merged
+            .works
+            .iter()
+            .map(|merged| merged_hit(merged, index, &|_: &CandidateWork| false))
+            .collect(),
+    }
+}
+
+/// The DOI `show` looks up: trimmed and without a `https://doi.org/` prefix,
+/// refused unless it looks like one (`10.<registrant>/<suffix>`), so a
+/// provider reference passed as `doi` fails before any request.
+fn doi_param(doi: &str) -> Result<String, String> {
+    let doi = pax_core::normalize_doi(doi.trim());
+    match doi.split_once('/') {
+        Some((prefix, suffix)) if prefix.starts_with("10.") && !suffix.is_empty() => {
+            Ok(doi.to_string())
+        }
+        _ => Err(format!(
+            "{doi:?} is not a DOI (expected e.g. `10.1145/359545.359563`)"
+        )),
+    }
+}
+
 fn provider_report<E: Display>(
     provider: ProviderId,
     result: &Result<SearchPage, E>,
@@ -937,6 +1273,191 @@ fn excluded(exclusion: Exclusion) -> Excluded {
     }
 }
 
+/// The tag and notes edits `edit` asks for. Blank tags are refused, since
+/// they'd be written into `papers.nix` as empty strings, and so is an edit
+/// with nothing in it (pax-core's own message for that names the CLI's
+/// flags).
+fn paper_edits(
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+    notes: Option<String>,
+) -> Result<PaperEdits, String> {
+    if add_tags
+        .iter()
+        .chain(&remove_tags)
+        .any(|tag| tag.trim().is_empty())
+    {
+        return Err("tags must not be blank".to_string());
+    }
+    if add_tags.is_empty() && remove_tags.is_empty() && notes.is_none() {
+        return Err("nothing to edit: give `add_tags`, `remove_tags`, and/or `notes`".to_string());
+    }
+    Ok(PaperEdits {
+        add_tags,
+        remove_tags,
+        notes,
+        ..PaperEdits::default()
+    })
+}
+
+/// The papers `export` renders, in library order: those named in `keys`
+/// (when given) that carry `tag` (when given). A key that isn't in the
+/// library is an error rather than silently missing from the export.
+fn select_papers(
+    papers: &[Paper],
+    keys: Option<&[String]>,
+    tag: Option<&str>,
+) -> Result<Vec<Paper>, String> {
+    if let Some(keys) = keys {
+        let unknown: Vec<&str> = keys
+            .iter()
+            .filter(|key| !papers.iter().any(|p| &p.local.citation_key == *key))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!("not in the library: {}", unknown.join(", ")));
+        }
+    }
+    let filter = ListFilter {
+        tag: tag.map(str::to_string),
+        ..ListFilter::default()
+    };
+    Ok(pax_core::filter_papers(papers, &filter)
+        .into_iter()
+        .filter(|p| keys.is_none_or(|keys| keys.contains(&p.local.citation_key)))
+        .collect())
+}
+
+/// How long `fetch` waits. pax-core already bounds each `nix` call it makes
+/// (prefetch, then `git add` and build), so this only caps their sum.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Runs blocking work (a `nix` call) on tokio's blocking pool, so it never
+/// stalls the server's executor; `None` once `timeout` passes. The work
+/// itself can't be cancelled and runs on to its end in the background.
+async fn blocking_with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<Option<T>, String> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
+        Ok(joined) => joined
+            .map(Some)
+            .map_err(|e| format!("the task failed: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `fetch`'s two pax-core steps: record the hash (downloading, unless one is
+/// recorded already), then build the PDF to get its store path.
+type FetchAttempt = Result<(FetchOutcome, Result<ResolvedArtifact, PaxError>), PaxError>;
+
+fn fetch_and_build(citation_key: &str, root: &Path) -> FetchAttempt {
+    let outcome = pax_core::fetch_paper(citation_key, root)?;
+    Ok((outcome, pax_core::resolve_artifact_path(citation_key, root)))
+}
+
+/// What a fetch attempt means for the agent. Only a bad citation key or an
+/// unreadable library is an error; a paper that can't be fetched is a
+/// result, with the reason.
+fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult, String> {
+    let result = |status, hash: Option<String>, reason: String| FetchResult {
+        citation_key: citation_key.to_string(),
+        status,
+        hash,
+        store_path: None,
+        reason: Some(reason),
+    };
+    let (outcome, built) = match attempt {
+        Ok(fetched) => fetched,
+        Err(PaxError::NoSourceUrl(_)) => {
+            return Ok(result(
+                FetchState::NoSourceUrl,
+                None,
+                "no PDF source is recorded (the provider found no open-access copy when it \
+                 was added), so there's nothing to fetch; record one with `pax edit \
+                 --source-url`"
+                    .to_string(),
+            ));
+        }
+        Err(e @ PaxError::Fetch(_)) => {
+            return Ok(result(FetchState::FetchFailed, None, e.to_string()));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let (status, hash) = match outcome {
+        FetchOutcome::Fetched { hash } => (FetchState::Fetched, hash),
+        FetchOutcome::AlreadyFetched { hash } => (FetchState::AlreadyFetched, hash),
+    };
+    Ok(match built {
+        Ok(ResolvedArtifact::Path(path)) => FetchResult {
+            citation_key: citation_key.to_string(),
+            status,
+            hash: Some(hash),
+            store_path: Some(path.display().to_string()),
+            reason: None,
+        },
+        Err(PaxError::Build(message)) if message.contains("hash mismatch") => result(
+            FetchState::HashMismatch,
+            Some(hash),
+            format!(
+                "the source no longer matches the recorded hash; `check` reports it too: \
+                 {message}"
+            ),
+        ),
+        Err(PaxError::Build(message)) if message.contains("not tracked by Git") => result(
+            FetchState::BuildFailed,
+            Some(hash),
+            format!(
+                "research/ isn't tracked by git, and nix only sees tracked files; `git add` \
+                 it in the repository that holds it, then fetch again: {message}"
+            ),
+        ),
+        Err(e) => result(FetchState::BuildFailed, Some(hash), e.to_string()),
+        Ok(_) => result(
+            FetchState::BuildFailed,
+            Some(hash),
+            "the hash is recorded, but the PDF still couldn't be resolved".to_string(),
+        ),
+    })
+}
+
+fn check_results(reports: Vec<CheckReport>) -> CheckResults {
+    let papers: Vec<PaperCheck> = reports
+        .into_iter()
+        .map(|report| {
+            let check = |status| PaperCheck {
+                citation_key: report.citation_key.clone(),
+                status,
+                expected: None,
+                actual: None,
+                error: None,
+            };
+            match report.status {
+                CheckStatus::NotFetched => check(CheckState::NotFetched),
+                CheckStatus::Reproducible => check(CheckState::Reproducible),
+                CheckStatus::Mismatch { expected, actual } => PaperCheck {
+                    expected: Some(expected),
+                    actual: Some(actual),
+                    ..check(CheckState::Mismatch)
+                },
+                CheckStatus::Error(message) => PaperCheck {
+                    error: Some(message),
+                    ..check(CheckState::Error)
+                },
+            }
+        })
+        .collect();
+    let count = |state| papers.iter().filter(|p| p.status == state).count();
+    CheckResults {
+        checked: papers.len(),
+        reproducible: count(CheckState::Reproducible),
+        not_fetched: count(CheckState::NotFetched),
+        mismatched: count(CheckState::Mismatch),
+        errored: count(CheckState::Error),
+        papers,
+    }
+}
+
 fn candidate(work: &CandidateWork, in_library: bool, excluded: bool) -> Candidate {
     Candidate {
         id: work.id.to_string(),
@@ -1000,7 +1521,7 @@ fn declared(paper: &Paper) -> DeclaredPaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pax_core::{Exclusions, Library, ProviderError};
+    use pax_core::{Exclusion, Exclusions};
     use std::fs;
 
     fn library_with_two_papers(name: &str) -> PathBuf {
@@ -1074,8 +1595,12 @@ mod tests {
             names,
             [
                 "add",
+                "check",
                 "cited_by",
+                "edit",
                 "exclude",
+                "export",
+                "fetch",
                 "list",
                 "refs",
                 "search",
@@ -1117,8 +1642,9 @@ mod tests {
         let server = PaxServer::new(root.clone(), Config::default());
 
         let Json(shown) = server
-            .show(Parameters(ReferenceParams {
-                reference: "hewitt1973".to_string(),
+            .show(Parameters(ShowParams {
+                reference: Some("hewitt1973".to_string()),
+                ..ShowParams::default()
             }))
             .await
             .unwrap();
@@ -1802,5 +2328,420 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    fn edit_of(reference: &str) -> EditParams {
+        EditParams {
+            reference: reference.to_string(),
+            ..EditParams::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_round_trips_tags_and_notes_through_papers_nix() {
+        let root = library_with_two_papers("edit");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(edited) = server
+            .edit(Parameters(EditParams {
+                add_tags: vec!["review-1".to_string(), "computability".to_string()],
+                remove_tags: vec!["concurrency".to_string()],
+                notes: Some("included: meets criterion C2".to_string()),
+                ..edit_of("hewitt1973")
+            }))
+            .await
+            .unwrap();
+        assert_eq!(edited.tags, ["review-1", "computability"]);
+        assert_eq!(
+            edited.notes.as_deref(),
+            Some("included: meets criterion C2")
+        );
+
+        let library = Library::load(&pax_core::nix::papers_path(&root)).unwrap();
+        let reloaded = declared(library.find("hewitt1973").unwrap());
+        assert_eq!(reloaded.tags, edited.tags);
+        assert_eq!(reloaded.notes, edited.notes);
+        let Json(tagged) = server
+            .list(Parameters(ListParams {
+                tag: Some("review-1".to_string()),
+                ..ListParams::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(tagged.papers.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_an_empty_edit_blank_tags_and_unknown_keys() {
+        let root = library_with_two_papers("edit-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let empty = server
+            .edit(Parameters(edit_of("hewitt1973")))
+            .await
+            .err()
+            .expect("an empty edit should be refused");
+        assert!(empty.contains("add_tags"), "{empty}");
+        let blank = server
+            .edit(Parameters(EditParams {
+                add_tags: vec![" ".to_string()],
+                ..edit_of("hewitt1973")
+            }))
+            .await;
+        assert!(blank.is_err());
+        let unknown = server
+            .edit(Parameters(EditParams {
+                notes: Some("n".to_string()),
+                ..edit_of("dijkstra1968")
+            }))
+            .await
+            .err()
+            .expect("an unknown citation key should be refused");
+        assert!(unknown.contains("dijkstra1968"), "{unknown}");
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn export_of(keys: Option<&[&str]>, tag: Option<&str>) -> Parameters<ExportParams> {
+        Parameters(ExportParams {
+            format: ExportFormat::Bibtex,
+            keys: keys.map(|keys| keys.iter().map(|k| k.to_string()).collect()),
+            tag: tag.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn export_renders_the_library_or_a_selection_as_bibtex() {
+        let root = library_with_two_papers("export");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(all) = server.export(export_of(None, None)).await.unwrap();
+        assert_eq!(all.citation_keys, ["turing1936", "hewitt1973"]);
+        assert!(all.text.contains("@article{turing1936,"), "{}", all.text);
+        assert!(all.text.contains("@article{hewitt1973,"), "{}", all.text);
+        assert!(
+            all.text.contains("doi = {10.1112/plms/s2-42.1.230}"),
+            "{}",
+            all.text
+        );
+
+        let Json(by_key) = server
+            .export(export_of(Some(&["hewitt1973"]), None))
+            .await
+            .unwrap();
+        assert_eq!(by_key.citation_keys, ["hewitt1973"]);
+        assert!(!by_key.text.contains("turing1936"));
+        assert!(
+            by_key
+                .text
+                .contains("title = {A Universal Modular Actor Formalism}")
+        );
+
+        let Json(by_tag) = server
+            .export(export_of(None, Some("computability")))
+            .await
+            .unwrap();
+        assert_eq!(by_tag.citation_keys, ["turing1936"]);
+
+        let Json(none) = server
+            .export(export_of(Some(&["hewitt1973"]), Some("computability")))
+            .await
+            .unwrap();
+        assert!(none.citation_keys.is_empty() && none.text.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_refuses_unknown_keys_and_formats() {
+        let root = library_with_two_papers("export-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let error = server
+            .export(export_of(Some(&["turing1936", "dijkstra1968"]), None))
+            .await
+            .err()
+            .expect("an unknown key should be refused");
+        assert!(
+            error.contains("dijkstra1968") && !error.contains("turing1936"),
+            "{error}"
+        );
+
+        let ris = serde_json::from_value::<ExportParams>(serde_json::json!({ "format": "ris" }));
+        assert!(ris.is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_reports_papers_without_a_source_url_as_not_fetched() {
+        // Neither fixture paper has a `source_url`, so pax-core runs no `nix`
+        // at all, even for turing1936's recorded hash.
+        let root = library_with_two_papers("check");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(checked) = server.check().await.unwrap();
+        let statuses: Vec<_> = checked
+            .papers
+            .iter()
+            .map(|p| (p.citation_key.as_str(), p.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("turing1936", CheckState::NotFetched),
+                ("hewitt1973", CheckState::NotFetched),
+            ]
+        );
+        assert_eq!((checked.checked, checked.not_fetched), (2, 2));
+        assert_eq!(
+            (checked.reproducible, checked.mismatched, checked.errored),
+            (0, 0, 0)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_results_carry_mismatched_hashes_and_errors() {
+        let report = |key: &str, status| CheckReport {
+            citation_key: key.to_string(),
+            status,
+        };
+        let out = check_results(vec![
+            report("a", CheckStatus::Reproducible),
+            report(
+                "b",
+                CheckStatus::Mismatch {
+                    expected: "sha256-old".to_string(),
+                    actual: "sha256-new".to_string(),
+                },
+            ),
+            report("c", CheckStatus::Error("fetch failed: 404".to_string())),
+        ]);
+        assert_eq!(
+            (out.checked, out.reproducible, out.mismatched, out.errored),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(out.papers[1].status, CheckState::Mismatch);
+        assert_eq!(out.papers[1].expected.as_deref(), Some("sha256-old"));
+        assert_eq!(out.papers[1].actual.as_deref(), Some("sha256-new"));
+        assert_eq!(out.papers[2].error.as_deref(), Some("fetch failed: 404"));
+        assert!(out.papers[0].error.is_none() && out.papers[0].expected.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_a_paper_without_a_source_url_without_running_nix() {
+        let root = library_with_two_papers("fetch");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let Json(result) = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "hewitt1973".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.status, FetchState::NoSourceUrl);
+        assert!(result.store_path.is_none() && result.hash.is_none());
+        assert!(result.reason.unwrap().contains("source"));
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        let unknown = server
+            .fetch(Parameters(CitationKeyParams {
+                reference: "dijkstra1968".to_string(),
+            }))
+            .await
+            .err()
+            .expect("an unknown citation key should be refused");
+        assert!(unknown.contains("dijkstra1968"), "{unknown}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fetch_results_say_what_happened_and_what_to_do() {
+        let built = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::Fetched {
+                    hash: "sha256-new".to_string(),
+                },
+                Ok(ResolvedArtifact::Path(PathBuf::from("/nix/store/x-turing"))),
+            )),
+        )
+        .unwrap();
+        assert_eq!(built.status, FetchState::Fetched);
+        assert_eq!(built.hash.as_deref(), Some("sha256-new"));
+        assert_eq!(built.store_path.as_deref(), Some("/nix/store/x-turing"));
+        assert!(built.reason.is_none());
+
+        let mismatch = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::AlreadyFetched {
+                    hash: "sha256-old".to_string(),
+                },
+                Err(PaxError::Build(
+                    "error: hash mismatch in fixed-output derivation".to_string(),
+                )),
+            )),
+        )
+        .unwrap();
+        assert_eq!(mismatch.status, FetchState::HashMismatch);
+        assert_eq!(mismatch.hash.as_deref(), Some("sha256-old"));
+        assert!(mismatch.store_path.is_none());
+
+        let untracked = fetch_result(
+            "turing1936",
+            Ok((
+                FetchOutcome::AlreadyFetched {
+                    hash: "sha256-old".to_string(),
+                },
+                Err(PaxError::Build(
+                    "error: path 'research/papers.nix' is not tracked by Git".to_string(),
+                )),
+            )),
+        )
+        .unwrap();
+        assert_eq!(untracked.status, FetchState::BuildFailed);
+        assert!(untracked.reason.unwrap().contains("git add"));
+
+        let failed = fetch_result(
+            "turing1936",
+            Err(PaxError::Fetch("`nix` timed out after 60s".to_string())),
+        )
+        .unwrap();
+        assert_eq!(failed.status, FetchState::FetchFailed);
+        assert!(failed.hash.is_none());
+        assert!(failed.reason.unwrap().contains("timed out"));
+
+        assert!(fetch_result("x", Err(PaxError::NoSuchPaper("x".to_string()))).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocking_work_past_its_timeout_is_reported_as_none() {
+        let slow = blocking_with_timeout(Duration::from_millis(10), || {
+            std::thread::sleep(Duration::from_millis(500));
+        })
+        .await
+        .unwrap();
+        assert!(slow.is_none());
+        let quick = blocking_with_timeout(Duration::from_secs(5), || 42)
+            .await
+            .unwrap();
+        assert_eq!(quick, Some(42));
+    }
+
+    #[tokio::test]
+    async fn show_takes_exactly_one_of_reference_or_doi() {
+        let server = PaxServer::new(PathBuf::from("."), Config::default());
+        let both_or_neither = [
+            ShowParams::default(),
+            ShowParams {
+                reference: Some("openalex:W2072794470".to_string()),
+                doi: Some("10.1145/359545.359563".to_string()),
+            },
+        ];
+        for params in both_or_neither {
+            let error = server
+                .show(Parameters(params))
+                .await
+                .err()
+                .expect("both or neither should be refused");
+            assert!(error.contains("exactly one"), "{error}");
+        }
+
+        let not_a_doi = server
+            .show(Parameters(ShowParams {
+                doi: Some("openalex:W2072794470".to_string()),
+                ..ShowParams::default()
+            }))
+            .await
+            .err()
+            .expect("a provider reference isn't a DOI");
+        assert!(not_a_doi.contains("not a DOI"), "{not_a_doi}");
+    }
+
+    #[test]
+    fn doi_params_are_normalized() {
+        assert_eq!(
+            doi_param(" https://doi.org/10.1112/plms/s2-42.1.230 ").unwrap(),
+            "10.1112/plms/s2-42.1.230"
+        );
+        for invalid in ["", "10.1112", "10.1112/", "turing1936"] {
+            assert!(doi_param(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn doi_records_merge_providers_and_flag_the_library() {
+        let root = library_with_two_papers("doi-records");
+        let index = LibraryIndex::load(&root);
+        let turing = "10.1112/plms/s2-42.1.230";
+        let results: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([
+                (
+                    ProviderId::OpenAlex,
+                    Ok(vec![work(
+                        ProviderId::OpenAlex,
+                        "W1",
+                        "On Computable Numbers",
+                        Some(turing),
+                    )]),
+                ),
+                (
+                    ProviderId::Crossref,
+                    Ok(vec![work(
+                        ProviderId::Crossref,
+                        turing,
+                        "On Computable Numbers",
+                        Some(turing),
+                    )]),
+                ),
+                (ProviderId::SemanticScholar, Err(ProviderError::NotFound)),
+            ]);
+
+        let out = doi_records(turing.to_string(), &results, &index);
+
+        let lookups: Vec<_> = out
+            .providers
+            .iter()
+            .map(|p| (p.provider.as_str(), p.found, p.error.is_some()))
+            .collect();
+        assert_eq!(
+            lookups,
+            [
+                ("openalex", true, false),
+                ("crossref", true, false),
+                ("semanticscholar", false, false),
+            ]
+        );
+        assert_eq!(out.results.len(), 1);
+        let hit = &out.results[0];
+        assert_eq!(hit.providers, ["openalex", "crossref"]);
+        assert!(hit.work.in_library && !hit.work.excluded);
+
+        let failed: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([(
+                ProviderId::OpenAlex,
+                Err(ProviderError::Request("timed out".to_string())),
+            )]);
+        let out = doi_records(turing.to_string(), &failed, &index);
+        assert!(out.results.is_empty());
+        assert!(
+            out.providers[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("timed out")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
