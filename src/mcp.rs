@@ -2695,13 +2695,56 @@ mod tests {
             .is_ok_and(|output| output.status.success())
     }
 
+    /// A test library whose papers a test adds to the Nix store. On drop it
+    /// removes the library, and with it the GC roots pax-core registered in
+    /// `research/.gcroots`, then deletes each store path in `store_paths`
+    /// (only those: never a whole-store garbage collection). Each test adds
+    /// files with its own content, so no other test shares a path.
+    struct StoreScratch {
+        root: PathBuf,
+        store_paths: Vec<String>,
+    }
+
+    impl StoreScratch {
+        fn new(root: PathBuf) -> Self {
+            StoreScratch {
+                root,
+                store_paths: Vec::new(),
+            }
+        }
+
+        /// Records a path a tool reported, for deletion.
+        fn track(&mut self, store_path: Option<&str>) {
+            if let Some(path) = store_path
+                && !self.store_paths.iter().any(|p| p == path)
+            {
+                self.store_paths.push(path.to_string());
+            }
+        }
+    }
+
+    impl Drop for StoreScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+            for path in &self.store_paths {
+                let deleted = std::process::Command::new("nix-store")
+                    .args(["--delete", path])
+                    .output();
+                if !deleted.is_ok_and(|output| output.status.success()) {
+                    eprintln!("couldn't delete {path} from the Nix store");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn fetch_with_a_file_records_its_hash_and_force_replaces_one() {
         if !nix_available() {
             eprintln!("skipped: nix isn't available");
             return;
         }
-        let root = library_with_two_papers("fetch-file");
+        let mut scratch = StoreScratch::new(library_with_two_papers("fetch-file"));
+        let root = scratch.root.clone();
         let server = PaxServer::new(root.clone(), Config::default());
         let papers = pax_core::nix::papers_path(&root);
         let pdf = root.join("paper.pdf");
@@ -2715,6 +2758,7 @@ mod tests {
         };
 
         let Json(added) = fetch("hewitt1973", false).await.unwrap();
+        scratch.track(added.store_path.as_deref());
         assert_eq!(added.status, FetchState::Fetched, "{:?}", added.reason);
         let hash = added.hash.expect("the file's hash");
         assert!(fs::read_to_string(&papers).unwrap().contains(&hash));
@@ -2732,11 +2776,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&papers).unwrap(), before);
 
         let Json(forced) = fetch("turing1936", true).await.unwrap();
+        scratch.track(forced.store_path.as_deref());
         assert_eq!(forced.status, FetchState::Fetched, "{:?}", forced.reason);
         assert_eq!(forced.hash.as_deref(), Some(hash.as_str()));
         assert!(!fs::read_to_string(&papers).unwrap().contains("sha256-AAAA"));
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
