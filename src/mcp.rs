@@ -14,7 +14,7 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pax_core::merge::PROVIDER_ORDER;
+use pax_core::merge::MERGE_ORDER;
 use pax_core::{
     CITATION_PROVIDERS, CandidateId, CandidateWork, CheckReport, CheckStatus, Config, DocType,
     Exclusion, ExclusionOptions, ExclusionStage, FetchOutcome, Filters, Library, LibraryIndex,
@@ -745,11 +745,7 @@ impl PaxServer {
             }
             _ => return Err("give exactly one of `query` or `author`".to_string()),
         };
-        Ok(Json(self.results(
-            logged,
-            &PROVIDER_ORDER,
-            options.abstracts,
-        )))
+        Ok(Json(self.results(logged, MERGE_ORDER, options.abstracts)))
     }
 
     /// The papers one or more seed papers cite (backward snowballing), from
@@ -1350,14 +1346,14 @@ fn merged_hit(
     }
 }
 
-/// Every provider's answer for a DOI, in `PROVIDER_ORDER`, and the records
+/// Every provider's answer for a DOI, in `MERGE_ORDER`, and the records
 /// found merged into one list flagged against `index`.
 fn doi_records(
     doi: String,
     results: &HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>>,
     index: &LibraryIndex,
 ) -> DoiRecords {
-    let providers = PROVIDER_ORDER
+    let providers = MERGE_ORDER
         .iter()
         .filter_map(|provider| {
             let result = results.get(provider)?;
@@ -1372,7 +1368,7 @@ fn doi_records(
         })
         .collect();
     let merged = pax_core::merge_works(
-        PROVIDER_ORDER
+        MERGE_ORDER
             .iter()
             .filter_map(|provider| results.get(provider)?.as_ref().ok())
             .flatten()
@@ -2111,13 +2107,7 @@ mod tests {
             ),
         ]);
 
-        let out = search_results(
-            &results,
-            &PROVIDER_ORDER,
-            &index,
-            LogOutcome::NoLibrary,
-            false,
-        );
+        let out = search_results(&results, MERGE_ORDER, &index, LogOutcome::NoLibrary, false);
 
         let providers: Vec<_> = out
             .providers
@@ -2181,7 +2171,7 @@ mod tests {
 
         let out = search_results(
             &results,
-            &PROVIDER_ORDER,
+            MERGE_ORDER,
             &LibraryIndex::default(),
             LogOutcome::Written(PathBuf::from("research/search-log.jsonl")),
             false,
@@ -2238,7 +2228,7 @@ mod tests {
         let out = |abstracts| {
             search_results(
                 &results,
-                &PROVIDER_ORDER,
+                MERGE_ORDER,
                 &LibraryIndex::default(),
                 LogOutcome::NoLibrary,
                 abstracts,
@@ -3047,10 +3037,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_reports_papers_without_a_source_url_as_not_fetched() {
-        // Neither fixture paper has a `source_url`, so pax-core runs no `nix`
-        // at all, even for turing1936's recorded hash.
+    async fn check_reports_papers_without_a_hash_as_not_fetched() {
+        // Neither paper has a hash, so pax-core runs no `nix` at all. (A hash
+        // without a `source_url`, as turing1936's in the fixture, is a local
+        // artifact, which pax-core looks up in the Nix store.)
         let root = library_with_two_papers("check");
+        let papers = root.join("research/papers.nix");
+        let without_hash = fs::read_to_string(&papers)
+            .unwrap()
+            .replace(r#"hash = "sha256-AAAA";"#, "hash = null;");
+        fs::write(&papers, without_hash).unwrap();
         let server = PaxServer::new(root.clone(), Config::default());
 
         let Json(checked) = server.check().await.unwrap();
