@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pax_core::output::{
-    Added, CheckResults, CitationResults, DeclaredPaper, DoiRecords, Excluded, ExclusionList,
-    Exported, FetchResult, FetchState, Lists, PaperList, SearchResults, Shown,
+    Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
+    ExclusionList, Exported, FetchResult, FetchState, Lists, PaperList, SearchResults, Shown,
 };
 use pax_core::{
     CandidateId, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage, FetchOutcome,
@@ -675,12 +675,18 @@ impl PaxServer {
     async fn check(&self) -> Result<Json<CheckResults>, String> {
         self.papers_path()?;
         let root = self.root.clone();
-        let checked = tokio::task::spawn_blocking(move || {
+        let mut checked = tokio::task::spawn_blocking(move || {
             pax_core::check_artifacts(&root).map(|checks| CheckResults::new(&checks))
         })
         .await
         .map_err(|e| format!("check didn't finish: {e}"))?
         .map_err(|e| e.to_string())?;
+        // pax-core's error names the CLI's commands.
+        for paper in &mut checked.papers {
+            if paper.status == CheckState::Missing {
+                paper.error = Some(file_needed_reason());
+            }
+        }
         Ok(Json(checked))
     }
 
@@ -1069,7 +1075,8 @@ fn readable_file(root: &Path, file: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// `file-needed`'s reason: pax-core's names the CLI's `--file`.
+/// `fetch`'s reason for `file-needed`, and `check`'s error for `missing`:
+/// pax-core's names the CLI's commands (`--file`, `sync --from`).
 fn file_needed_reason() -> String {
     "this paper was added from a local file, which isn't in this Nix store; fetch again \
      with `file` set to the PDF's path to provide it again"
@@ -1079,7 +1086,7 @@ fn file_needed_reason() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pax_core::output::{CheckState, SearchLogStatus};
+    use pax_core::output::SearchLogStatus;
     use pax_core::{CandidateWork, Exclusion, Exclusions, LogOutcome, ProviderError};
     use std::fs;
 
