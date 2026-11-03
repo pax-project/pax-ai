@@ -16,13 +16,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pax_core::output::{
-    Added, CheckResults, CitationResults, DeclaredPaper, DoiRecords, Excluded, Exported,
-    FetchResult, FetchState, Lists, PaperList, SearchResults, Shown,
+    Added, CheckResults, CitationResults, DeclaredPaper, DoiRecords, Excluded, ExclusionList,
+    Exported, FetchResult, FetchState, Lists, PaperList, SearchResults, Shown,
 };
 use pax_core::{
-    CandidateId, Config, DocType, ExclusionOptions, ExclusionStage, FetchOutcome, Filters, Library,
-    LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper, PaperEdits, PaxError, ProviderId,
-    ResolvedArtifact, SearchOptions, SearchPage, SeedResults, Stats, YearRange,
+    CandidateId, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage, FetchOutcome,
+    Filters, Library, LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper, PaperEdits,
+    PaxError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults, Stats,
+    YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -259,12 +260,31 @@ pub struct EditParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListParams {
-    /// Case-insensitive substring of an author's name.
+    /// List the excluded papers in `research/excluded.nix` instead of the
+    /// declared ones (the `pax` CLI's `list --excluded`).
+    #[serde(default)]
+    pub excluded: bool,
+    /// Case-insensitive substring of an author's name. Declared papers only.
     pub author: Option<String>,
     /// Publication year.
     pub year: Option<i32>,
-    /// Exact tag.
+    /// Exact tag. Declared papers only.
     pub tag: Option<String>,
+    /// Exact exclusion criterion, e.g. `X3`. With `excluded: true` only.
+    pub criterion: Option<String>,
+    /// Exact screening round, e.g. `R1`. With `excluded: true` only.
+    pub round: Option<String>,
+}
+
+/// What `list` returns: pax-core's [`PaperList`] (`papers`) for declared
+/// papers, or its [`ExclusionList`] (`exclusions`) with `excluded: true`,
+/// the shapes `pax list --json` and `pax list --excluded --json` print.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListOutput {
+    #[serde(flatten)]
+    pub declared: Option<PaperList>,
+    #[serde(flatten)]
+    pub excluded: Option<ExclusionList>,
 }
 
 /// The text format `export` renders.
@@ -568,22 +588,52 @@ impl PaxServer {
         Ok(Json(stats))
     }
 
-    /// List the papers declared in the library, optionally filtered by author,
-    /// year, and tag (all combined with AND).
+    /// List the papers declared in the library (`papers`), optionally
+    /// filtered by author, year, and tag; or, with `excluded: true`, the
+    /// papers excluded from the review in research/excluded.nix
+    /// (`exclusions`: key, alias, title, year, reason, stage, criterion,
+    /// round), optionally filtered by year, criterion, and round. Filters
+    /// combine with AND; tag, criterion, and round match exactly.
     #[tool]
     async fn list(
         &self,
         Parameters(params): Parameters<ListParams>,
-    ) -> Result<Json<PaperList>, String> {
-        let library = pax_core::Library::load(&pax_core::nix::papers_path(&self.root))
-            .map_err(|e| e.to_string())?;
+    ) -> Result<Json<ListOutput>, String> {
+        let papers_path = self.papers_path()?;
+        if params.excluded {
+            if params.author.is_some() || params.tag.is_some() {
+                return Err("`author` and `tag` filter declared papers: drop them, \
+                            or drop `excluded`"
+                    .to_string());
+            }
+            let exclusions = pax_core::Exclusions::load(&pax_core::nix::excluded_path(&self.root))
+                .map_err(|e| e.to_string())?;
+            let filter = ExclusionFilter::new()
+                .with_year(params.year)
+                .with_criterion(params.criterion)
+                .with_round(params.round);
+            let matching = pax_core::filter_exclusions(exclusions.entries(), &filter);
+            return Ok(Json(ListOutput {
+                declared: None,
+                excluded: Some(ExclusionList::new(&matching)),
+            }));
+        }
+        if params.criterion.is_some() || params.round.is_some() {
+            return Err("`criterion` and `round` filter exclusions: \
+                        pass `excluded: true` to list them"
+                .to_string());
+        }
+        let library = pax_core::Library::load(&papers_path).map_err(|e| e.to_string())?;
         let filter = ListFilter {
             author: params.author,
             year: params.year,
             tag: params.tag,
         };
         let papers = pax_core::filter_papers(library.papers(), &filter);
-        Ok(Json(PaperList::new(&papers)))
+        Ok(Json(ListOutput {
+            declared: Some(PaperList::new(&papers)),
+            excluded: None,
+        }))
     }
 
     /// Export declared papers as BibTeX text: the whole library, or only the
@@ -729,7 +779,7 @@ impl ServerHandler for PaxServer {
                  an exclusion the reviewer reconsiders), tag and annotate \
                  declared papers (edit), fetch a paper's PDF through Nix \
                  (fetch, which can take minutes), verify fetched PDFs still \
-                 reproduce (check), list what's declared (list), export it as \
+                 reproduce (check), list what's declared or excluded (list), export it as \
                  BibTeX text (export), and report PRISMA flow counts (stats). \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
@@ -1065,7 +1115,8 @@ mod tests {
             .list(Parameters(ListParams::default()))
             .await
             .unwrap();
-        assert_eq!(all.papers.len(), 2);
+        assert!(all.excluded.is_none());
+        assert_eq!(all.declared.unwrap().papers.len(), 2);
 
         let Json(tagged) = server
             .list(Parameters(ListParams {
@@ -1074,9 +1125,157 @@ mod tests {
             }))
             .await
             .unwrap();
+        let tagged = tagged.declared.unwrap();
         assert_eq!(tagged.papers.len(), 1);
         assert_eq!(tagged.papers[0].citation_key, "turing1936");
         assert!(tagged.papers[0].fetched);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_excluded_filters_exclusions_exactly() {
+        let root = library_with_two_papers("list-excluded");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(none) = server
+            .list(Parameters(ListParams {
+                excluded: true,
+                ..ListParams::default()
+            }))
+            .await
+            .unwrap();
+        assert!(none.declared.is_none());
+        assert!(none.excluded.unwrap().exclusions.is_empty());
+
+        for (doi, year, criterion, round) in [
+            ("10.1000/a", 2019, "X3", "R1"),
+            ("10.1000/b", 2020, "X3", "R2"),
+            ("10.1000/c", 2020, "X1", "R1"),
+        ] {
+            let Parameters(params) = exclusion(doi, "off topic", Some("A Paper"));
+            server
+                .exclude(Parameters(ExcludeParams {
+                    year: Some(year),
+                    criterion: Some(criterion.to_string()),
+                    round: Some(round.to_string()),
+                    ..params
+                }))
+                .await
+                .unwrap();
+        }
+
+        let keys = |params: ListParams| {
+            let server = server.clone();
+            async move {
+                let Json(out) = server
+                    .list(Parameters(ListParams {
+                        excluded: true,
+                        ..params
+                    }))
+                    .await
+                    .unwrap();
+                assert!(out.declared.is_none());
+                out.excluded
+                    .unwrap()
+                    .exclusions
+                    .into_iter()
+                    .map(|e| e.key)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            keys(ListParams::default()).await,
+            ["10.1000/a", "10.1000/b", "10.1000/c"]
+        );
+        assert_eq!(
+            keys(ListParams {
+                year: Some(2020),
+                ..ListParams::default()
+            })
+            .await,
+            ["10.1000/b", "10.1000/c"]
+        );
+        assert_eq!(
+            keys(ListParams {
+                criterion: Some("X3".to_string()),
+                round: Some("R1".to_string()),
+                ..ListParams::default()
+            })
+            .await,
+            ["10.1000/a"]
+        );
+        assert!(
+            keys(ListParams {
+                round: Some("r1".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .is_empty(),
+            "round matches exactly"
+        );
+
+        let Json(out) = server
+            .list(Parameters(ListParams {
+                excluded: true,
+                criterion: Some("X1".to_string()),
+                ..ListParams::default()
+            }))
+            .await
+            .unwrap();
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 1, "{json}");
+        let exclusion = &json["exclusions"][0];
+        assert_eq!(
+            (
+                &exclusion["key"],
+                &exclusion["title"],
+                &exclusion["year"],
+                &exclusion["reason"],
+                &exclusion["stage"],
+                &exclusion["criterion"],
+                &exclusion["round"],
+                &exclusion["alias"],
+            ),
+            (
+                &serde_json::json!("10.1000/c"),
+                &serde_json::json!("A Paper"),
+                &serde_json::json!(2020),
+                &serde_json::json!("off topic"),
+                &serde_json::json!("full-text"),
+                &serde_json::json!("X1"),
+                &serde_json::json!("R1"),
+                &serde_json::Value::Null,
+            )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_refuses_filters_of_the_other_set() {
+        let root = library_with_two_papers("list-mixed");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let err = server
+            .list(Parameters(ListParams {
+                excluded: true,
+                tag: Some("computability".to_string()),
+                ..ListParams::default()
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("`tag`"), "{err}");
+        let err = server
+            .list(Parameters(ListParams {
+                round: Some("R1".to_string()),
+                ..ListParams::default()
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("excluded: true"), "{err}");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1674,6 +1873,7 @@ mod tests {
             .list(Parameters(ListParams::default()))
             .await
             .unwrap();
+        let listed = listed.declared.unwrap();
         assert_eq!(listed.papers.len(), 2, "excluding doesn't declare anything");
 
         fs::remove_dir_all(root).unwrap();
@@ -1952,6 +2152,7 @@ mod tests {
             .list(Parameters(ListParams::default()))
             .await
             .unwrap();
+        let listed = listed.declared.unwrap();
         assert_eq!(listed.papers.len(), 2, "nothing was declared");
 
         fs::remove_dir_all(root).unwrap();
@@ -2079,7 +2280,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(tagged.papers.len(), 1);
+        assert_eq!(tagged.declared.unwrap().papers.len(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2591,6 +2792,7 @@ mod tests {
             .list(Parameters(ListParams::default()))
             .await
             .unwrap();
+        let listed = listed.declared.unwrap();
         let mut aliases: Vec<_> = listed
             .papers
             .iter()
