@@ -18,13 +18,13 @@ use std::time::Duration;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
     ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, PaperList, PdfCopyState,
-    SearchResults, Shown,
+    SearchResults, Shown, SyncResults,
 };
 use pax_core::{
     CandidateId, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage, FetchOutcome,
     Filters, Library, LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper, PaperEdits,
     PaxError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults, Stats,
-    YearRange,
+    SyncReport, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -192,6 +192,14 @@ pub struct FetchParams {
     /// match (otherwise that's a `hash-mismatch`, and nothing is written).
     #[serde(default)]
     pub force: bool,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SyncParams {
+    /// A backup directory `export` wrote with `format: "pdfs"` (or any
+    /// holding `<citation_key>.pdf` files) to restore PDFs added from local
+    /// files from: an absolute path, or one relative to the library root.
+    pub from: Option<String>,
 }
 
 /// When in screening a paper was excluded; PRISMA reports the two apart.
@@ -679,8 +687,10 @@ impl PaxServer {
     /// included, since Nix downloads them again. Nothing is uploaded: the
     /// PDFs stay in `dir` on this machine unless the user copies the
     /// directory elsewhere, so choose one outside `research/`, which pax
-    /// stages in git. A paper whose file isn't in this Nix store is
-    /// reported as `missing` and the rest are still exported.
+    /// stages in git. `sync` with `from` set to the directory restores the
+    /// backup, here or on another machine with the same library. A paper
+    /// whose file isn't in this Nix store is reported as `missing` and the
+    /// rest are still exported.
     #[tool]
     async fn export(
         &self,
@@ -738,8 +748,9 @@ impl PaxServer {
     /// hash (one `nix store prefetch-file` per paper, so it needs the
     /// network), without writing anything. Papers not fetched yet are
     /// reported as such, and a paper added from a local file that isn't in
-    /// this machine's Nix store as `missing`; one paper's failure doesn't
-    /// stop the rest.
+    /// this machine's Nix store as `missing` (`fetch` with `file` provides
+    /// it again, or `sync` with `from` restores it from a backup); one
+    /// paper's failure doesn't stop the rest.
     #[tool]
     async fn check(&self) -> Result<Json<CheckResults>, String> {
         self.papers_path()?;
@@ -764,7 +775,9 @@ impl PaxServer {
     /// store and returns the path. Can take minutes; it gives up after a
     /// timeout. A paper that can't be fetched (no source URL, download or
     /// build failure, hash mismatch, a local file no longer in the Nix
-    /// store) is reported in `status` and `reason`, not as an error. An excluded paper's alias is refused: it isn't in the
+    /// store, which `file` or a backup restored with `sync`'s `from`
+    /// provides again) is reported in `status` and `reason`, not as an
+    /// error. An excluded paper's alias is refused: it isn't in the
     /// library.
     ///
     /// With `file`, declares a PDF the user already has instead of
@@ -809,6 +822,41 @@ impl PaxServer {
             ),
         };
         Ok(Json(result))
+    }
+
+    /// Fetch every declared paper's PDF through Nix, as `fetch` does for
+    /// one (as `pax sync` does): one result per paper, in library order, and
+    /// one paper's failure doesn't stop the rest. Needs the network and can
+    /// take a long time on a large library.
+    ///
+    /// With `from`, first restore the PDFs added from local files from a
+    /// backup directory on this machine, as `export` with `format: "pdfs"`
+    /// writes one (`<citation_key>.pdf` files plus a manifest): each such
+    /// paper whose file is there is added back to the Nix store when the
+    /// file's hash is the one recorded in `papers.nix`, and reported as a
+    /// `hash-mismatch` and skipped when it isn't; a recorded hash is never
+    /// replaced. Every other paper is fetched as without `from`. A `from`
+    /// that isn't a directory is an error.
+    #[tool]
+    async fn sync(
+        &self,
+        Parameters(params): Parameters<SyncParams>,
+    ) -> Result<Json<SyncResults>, String> {
+        self.papers_path()?;
+        let from = match params.from.as_deref().map(str::trim) {
+            Some("") => return Err("`from` is blank: give the backup directory".to_string()),
+            Some(dir) => Some(self.root.join(dir)),
+            None => None,
+        };
+        let root = self.root.clone();
+        let reports = tokio::task::spawn_blocking(move || match from {
+            Some(dir) => pax_core::sync_library_from(&root, &dir),
+            None => pax_core::sync_library(&root),
+        })
+        .await
+        .map_err(|e| format!("sync didn't finish: {e}"))?
+        .map_err(|e| e.to_string())?;
+        Ok(Json(sync_results(&reports)))
     }
 }
 
@@ -878,7 +926,8 @@ impl ServerHandler for PaxServer {
                  the protocol's criterion (exclude, and unexclude to reverse \
                  an exclusion the reviewer reconsiders), tag and annotate \
                  declared papers (edit), fetch a paper's PDF through Nix \
-                 (fetch, which can take minutes), verify fetched PDFs still \
+                 (fetch, which can take minutes) or every paper's (sync, \
+                 which with `from` also restores a backup), verify fetched PDFs still \
                  reproduce (check), list what's declared or excluded (list), export it as \
                  BibTeX text or back up the PDFs added from local files to a \
                  directory on this machine (export), and report PRISMA flow \
@@ -1062,44 +1111,64 @@ fn fetch_and_build(citation_key: &str, file: Option<(PathBuf, bool)>, root: &Pat
     Ok((outcome, pax_core::resolve_artifact_path(citation_key, root)))
 }
 
+/// A paper that couldn't be fetched, as pax-core reports it, with the
+/// reason worded for the agent where pax-core's names the CLI's flags.
+fn failed_fetch(citation_key: &str, e: &PaxError) -> FetchResult {
+    let mut result = FetchResult::failed(citation_key, e);
+    let reason = match e {
+        PaxError::NoSourceUrl(_) => "no PDF source is recorded (the provider found no \
+             open-access copy when it was added), so there's nothing to fetch; if the user \
+             has the PDF (e.g. through a university login), fetch again with `file` set to \
+             its path, or record a source with `pax edit --source-url`"
+            .to_string(),
+        PaxError::HashMismatch {
+            recorded, actual, ..
+        } => format!(
+            "a different file is already recorded (hash {recorded}; this file's is \
+             {actual}), so nothing was written; fetch again with `force: true` to replace it"
+        ),
+        PaxError::BackupMismatch {
+            file,
+            recorded,
+            actual,
+            ..
+        } => format!(
+            "{} isn't the PDF recorded for this paper (hash {recorded}; the file's is \
+             {actual}), so it was skipped and nothing was written; the backup may be of \
+             another version of the paper",
+            file.display()
+        ),
+        PaxError::LocalArtifactMissing(_) => file_needed_reason(),
+        _ => return result,
+    };
+    result.reason = Some(reason);
+    result
+}
+
+/// pax-core's [`SyncResults`], with each failed paper's reason worded as
+/// `fetch` words it.
+fn sync_results(reports: &[SyncReport]) -> SyncResults {
+    let mut results = SyncResults::new(reports);
+    for (result, report) in results.papers.iter_mut().zip(reports) {
+        if let Err(e) = &report.result {
+            result.reason = failed_fetch(&report.citation_key, e).reason;
+        }
+    }
+    results
+}
+
 /// What a fetch attempt means for the agent. Only a bad citation key or an
 /// unreadable library is an error; a paper that can't be fetched is a
 /// result, with the reason.
 fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult, String> {
     let (outcome, built) = match attempt {
         Ok(fetched) => fetched,
-        Err(e @ PaxError::NoSourceUrl(_)) => {
-            let mut result = FetchResult::failed(citation_key, &e);
-            result.reason = Some(
-                "no PDF source is recorded (the provider found no open-access copy when it \
-                 was added), so there's nothing to fetch; if the user has the PDF (e.g. \
-                 through a university login), fetch again with `file` set to its path, or \
-                 record a source with `pax edit --source-url`"
-                    .to_string(),
-            );
-            return Ok(result);
-        }
         Err(
-            ref e @ PaxError::HashMismatch {
-                ref recorded,
-                ref actual,
-                ..
-            },
-        ) => {
-            let mut result = FetchResult::failed(citation_key, e);
-            result.reason = Some(format!(
-                "a different file is already recorded (hash {recorded}; this file's is \
-                 {actual}), so nothing was written; fetch again with `force: true` to \
-                 replace it"
-            ));
-            return Ok(result);
-        }
-        Err(e @ PaxError::LocalArtifactMissing(_)) => {
-            let mut result = FetchResult::failed(citation_key, &e);
-            result.reason = Some(file_needed_reason());
-            return Ok(result);
-        }
-        Err(e @ PaxError::Fetch(_)) => return Ok(FetchResult::failed(citation_key, &e)),
+            e @ (PaxError::NoSourceUrl(_)
+            | PaxError::HashMismatch { .. }
+            | PaxError::LocalArtifactMissing(_)
+            | PaxError::Fetch(_)),
+        ) => return Ok(failed_fetch(citation_key, &e)),
         Err(e) => return Err(name_error(e)),
     };
     // The hash is recorded either way; only building the PDF can still fail.
@@ -1146,11 +1215,14 @@ fn readable_file(root: &Path, file: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// `fetch`'s reason for `file-needed`, and `check`'s error for `missing`:
-/// pax-core's names the CLI's commands (`--file`, `sync --from`).
+/// `fetch`'s and `sync`'s reason for `file-needed`, and `check`'s and
+/// `export`'s error for `missing`: pax-core's names the CLI's commands
+/// (`--file`, `sync --from`).
 fn file_needed_reason() -> String {
     "this paper was added from a local file, which isn't in this Nix store; fetch again \
-     with `file` set to the PDF's path to provide it again"
+     with `file` set to the PDF's path to provide it again, or, if its PDFs were backed up \
+     with `export` (`format: \"pdfs\"`), restore the backup with `sync`, `from` set to its \
+     directory"
         .to_string()
 }
 
@@ -1244,6 +1316,7 @@ mod tests {
                 "search",
                 "show",
                 "stats",
+                "sync",
                 "unexclude",
             ]
         );
@@ -2623,6 +2696,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_refuses_a_blank_or_missing_backup_directory() {
+        let root = library_with_two_papers("sync-refused");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+
+        let blank = server.sync(sync_from(Some(" "))).await.err().unwrap();
+        assert!(blank.contains("`from`"), "{blank}");
+        let missing = server
+            .sync(sync_from(Some("no-such-dir")))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            missing.contains(&root.join("no-such-dir").display().to_string())
+                && missing.contains("not a directory"),
+            "{missing}"
+        );
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        let elsewhere = PaxServer::new(root.join("research"), Config::default());
+        let no_library = elsewhere.sync(sync_from(None)).await.err().unwrap();
+        assert!(no_library.contains("no pax library"), "{no_library}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_reports_every_paper_with_or_without_a_backup() {
+        // No paper has a hash or a source URL, so nothing runs `nix`.
+        let root = library_with_two_papers("sync");
+        without_hashes(&root);
+        fs::create_dir_all(root.join("backup")).unwrap();
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        for from in [None, Some("backup")] {
+            let Json(synced) = server.sync(sync_from(from)).await.unwrap();
+            let keys: Vec<_> = synced.papers.iter().map(|p| &p.citation_key).collect();
+            assert_eq!(keys, ["turing1936", "hewitt1973"]);
+            for paper in &synced.papers {
+                assert_eq!(paper.status, FetchState::NoSourceUrl);
+                let reason = paper.reason.as_deref().unwrap();
+                assert!(reason.contains("`file`"), "{reason}");
+            }
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_results_say_why_a_backup_was_skipped() {
+        let report = |citation_key: &str, result| SyncReport {
+            citation_key: citation_key.to_string(),
+            result,
+        };
+        let synced = sync_results(&[
+            report(
+                "turing1936",
+                Ok(FetchOutcome::Fetched {
+                    hash: "sha256-ok".to_string(),
+                }),
+            ),
+            report(
+                "hewitt1973",
+                Err(PaxError::BackupMismatch {
+                    citation_key: "hewitt1973".to_string(),
+                    file: PathBuf::from("/backup/hewitt1973.pdf"),
+                    recorded: "sha256-old".to_string(),
+                    actual: "sha256-new".to_string(),
+                }),
+            ),
+            report(
+                "knuth1974",
+                Err(PaxError::LocalArtifactMissing("knuth1974".to_string())),
+            ),
+        ]);
+        let statuses: Vec<_> = synced.papers.iter().map(|p| p.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                FetchState::Fetched,
+                FetchState::HashMismatch,
+                FetchState::FileNeeded
+            ]
+        );
+        assert!(synced.papers[0].reason.is_none());
+        let skipped = synced.papers[1].reason.as_deref().unwrap();
+        assert!(
+            [
+                "/backup/hewitt1973.pdf",
+                "sha256-old",
+                "sha256-new",
+                "skipped"
+            ]
+            .iter()
+            .all(|part| skipped.contains(part)),
+            "{skipped}"
+        );
+        assert!(!skipped.contains("force"), "{skipped}");
+        let needed = synced.papers[2].reason.as_deref().unwrap();
+        assert!(
+            needed.contains("`file`") && needed.contains("`from`") && !needed.contains("--"),
+            "{needed}"
+        );
+    }
+
+    #[tokio::test]
     async fn check_reports_papers_without_a_hash_as_not_fetched() {
         // Neither paper has a hash, so pax-core runs no `nix` at all. (A hash
         // without a `source_url`, as turing1936's in the fixture, is a local
@@ -2757,7 +2938,11 @@ mod tests {
         let missing = PaxError::LocalArtifactMissing("turing1936".to_string());
         let file_needed = fetch_result("turing1936", Err(missing)).unwrap();
         assert_eq!(file_needed.status, FetchState::FileNeeded);
-        assert!(file_needed.reason.unwrap().contains("`file`"));
+        let reason = file_needed.reason.unwrap();
+        assert!(
+            reason.contains("`file`") && reason.contains("`sync`") && reason.contains("`from`"),
+            "{reason}"
+        );
         let unbuilt = fetch_result(
             "turing1936",
             Ok((
@@ -2987,6 +3172,101 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest, serde_json::json!({ "hewitt1973": hash }));
+    }
+
+    /// Removes `citation_key`'s GC root and its PDF from the Nix store, as
+    /// on a machine that never had it.
+    fn drop_from_store(root: &Path, citation_key: &str, store_path: &str) {
+        fs::remove_file(root.join("research/.gcroots").join(citation_key)).unwrap();
+        let deleted = std::process::Command::new("nix-store")
+            .args(["--delete", store_path])
+            .output()
+            .unwrap();
+        assert!(
+            deleted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&deleted.stderr)
+        );
+    }
+
+    fn sync_from(from: Option<&str>) -> Parameters<SyncParams> {
+        Parameters(SyncParams {
+            from: from.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn sync_from_restores_a_backup_and_skips_a_mismatching_file() {
+        if !nix_available() {
+            eprintln!("skipped: nix isn't available");
+            return;
+        }
+        let mut scratch = StoreScratch::new(library_with_two_papers("sync-from"));
+        let root = scratch.root.clone();
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let hash = add_local_pdf(
+            &server,
+            &mut scratch,
+            "hewitt1973",
+            "%PDF-1.4 pax-ai sync test\n",
+        )
+        .await;
+        let store_path = scratch.store_paths[0].clone();
+        let exported = pdfs(server.export(pdfs_to(Some("backup"))).await);
+        assert_eq!(exported.exported, 1);
+
+        // On a machine without the PDF, check and export point at the backup.
+        // (pax-core rewrites papers.nix in key order when it records a hash.)
+        drop_from_store(&root, "hewitt1973", &store_path);
+        let Json(checked) = server.check().await.unwrap();
+        let missing = checked
+            .papers
+            .iter()
+            .find(|p| p.citation_key == "hewitt1973")
+            .unwrap();
+        assert_eq!(missing.status, CheckState::Missing);
+        let reason = missing.error.as_deref().unwrap();
+        assert!(
+            reason.contains("`file`") && reason.contains("`from`"),
+            "{reason}"
+        );
+        let again = pdfs(server.export(pdfs_to(Some("backup-again"))).await);
+        assert_eq!((again.exported, again.missing), (0, 1));
+        assert_eq!(again.papers[0].status, PdfCopyState::Missing);
+        assert!(again.papers[0].error.as_deref().unwrap().contains("`from`"));
+
+        let by_key = |results: SyncResults| -> HashMap<String, FetchResult> {
+            results
+                .papers
+                .into_iter()
+                .map(|p| (p.citation_key.clone(), p))
+                .collect()
+        };
+        let Json(restored) = server.sync(sync_from(Some("backup"))).await.unwrap();
+        let restored = by_key(restored);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored["turing1936"].status, FetchState::NoSourceUrl);
+        let hewitt = &restored["hewitt1973"];
+        assert_eq!(hewitt.status, FetchState::Fetched, "{:?}", hewitt.reason);
+        assert_eq!(hewitt.hash.as_deref(), Some(hash.as_str()));
+        assert!(Path::new(&store_path).exists());
+        let Json(checked) = server.check().await.unwrap();
+        assert_eq!(checked.missing, 0);
+
+        // A backup file with other content is skipped, never forced.
+        let before = fs::read_to_string(&papers).unwrap();
+        fs::write(root.join("backup/hewitt1973.pdf"), "%PDF-1.4 another\n").unwrap();
+        let Json(skipped) = server.sync(sync_from(Some("backup"))).await.unwrap();
+        let mismatch = &by_key(skipped)["hewitt1973"];
+        assert_eq!(mismatch.status, FetchState::HashMismatch);
+        let reason = mismatch.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("skipped") && reason.contains(&hash),
+            "{reason}"
+        );
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
     }
 
     #[tokio::test]
