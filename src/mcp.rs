@@ -160,10 +160,19 @@ pub struct ShowParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CitationKeyParams {
+pub struct FetchParams {
     /// The citation key or alias of a paper in the library, e.g.
     /// `turing1936` or `P17`.
     pub reference: String,
+    /// A PDF the user already has (e.g. a paywalled paper downloaded through
+    /// a university login), added as the paper's artifact instead of
+    /// downloading it: an absolute path, or one relative to the library
+    /// root.
+    pub file: Option<String>,
+    /// With `file`, replace an already-recorded hash that the file doesn't
+    /// match (otherwise that's a `hash-mismatch`, and nothing is written).
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// When in screening a paper was excluded; PRISMA reports the two apart.
@@ -606,12 +615,27 @@ impl PaxServer {
     /// build failure, hash mismatch, a local file no longer in the Nix
     /// store) is reported in `status` and `reason`, not as an error. An excluded paper's alias is refused: it isn't in the
     /// library.
+    ///
+    /// With `file`, declares a PDF the user already has instead of
+    /// downloading one (as `pax fetch --file` does): it's added to the Nix
+    /// store and its hash recorded. A file that doesn't match a hash
+    /// already recorded is a `hash-mismatch` unless `force`. A missing or
+    /// unreadable file is an error.
     #[tool]
     async fn fetch(
         &self,
-        Parameters(params): Parameters<CitationKeyParams>,
+        Parameters(params): Parameters<FetchParams>,
     ) -> Result<Json<FetchResult>, String> {
         let path = self.papers_path()?;
+        let file = params
+            .file
+            .as_deref()
+            .map(|file| readable_file(&self.root, file))
+            .transpose()?;
+        if params.force && file.is_none() {
+            return Err("`force` only applies with `file`".to_string());
+        }
+        let source = file.map(|file| (file, params.force));
         // An alias is reported as the citation key it names; an unknown name
         // is left to pax-core to refuse.
         let citation_key = Library::load(&path)
@@ -620,7 +644,8 @@ impl PaxServer {
             .unwrap_or(params.reference);
         let (key, root) = (citation_key.clone(), self.root.clone());
         let attempt =
-            blocking_with_timeout(FETCH_TIMEOUT, move || fetch_and_build(&key, &root)).await?;
+            blocking_with_timeout(FETCH_TIMEOUT, move || fetch_and_build(&key, source, &root))
+                .await?;
         let result = match attempt {
             Some(attempt) => fetch_result(&citation_key, attempt)?,
             None => FetchResult::timed_out(
@@ -871,11 +896,16 @@ async fn blocking_with_timeout<T: Send + 'static>(
 }
 
 /// `fetch`'s two pax-core steps: record the hash (downloading, unless one is
-/// recorded already), then build the PDF to get its store path.
+/// recorded already, or adding `file`), then build the PDF to get its store
+/// path.
 type FetchAttempt = Result<(FetchOutcome, Result<ResolvedArtifact, PaxError>), PaxError>;
 
-fn fetch_and_build(citation_key: &str, root: &Path) -> FetchAttempt {
-    let outcome = pax_core::fetch_paper(citation_key, root)?;
+/// `file` is a local PDF to add instead of downloading, with `force`.
+fn fetch_and_build(citation_key: &str, file: Option<(PathBuf, bool)>, root: &Path) -> FetchAttempt {
+    let outcome = match file {
+        Some((file, force)) => pax_core::fetch_file(citation_key, &file, force, root)?,
+        None => pax_core::fetch_paper(citation_key, root)?,
+    };
     Ok((outcome, pax_core::resolve_artifact_path(citation_key, root)))
 }
 
@@ -889,15 +919,34 @@ fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult
             let mut result = FetchResult::failed(citation_key, &e);
             result.reason = Some(
                 "no PDF source is recorded (the provider found no open-access copy when it \
-                 was added), so there's nothing to fetch; record one with `pax edit \
-                 --source-url`"
+                 was added), so there's nothing to fetch; if the user has the PDF (e.g. \
+                 through a university login), fetch again with `file` set to its path, or \
+                 record a source with `pax edit --source-url`"
                     .to_string(),
             );
             return Ok(result);
         }
-        Err(e @ (PaxError::Fetch(_) | PaxError::LocalArtifactMissing(_))) => {
-            return Ok(FetchResult::failed(citation_key, &e));
+        Err(
+            ref e @ PaxError::HashMismatch {
+                ref recorded,
+                ref actual,
+                ..
+            },
+        ) => {
+            let mut result = FetchResult::failed(citation_key, e);
+            result.reason = Some(format!(
+                "a different file is already recorded (hash {recorded}; this file's is \
+                 {actual}), so nothing was written; fetch again with `force: true` to \
+                 replace it"
+            ));
+            return Ok(result);
         }
+        Err(e @ PaxError::LocalArtifactMissing(_)) => {
+            let mut result = FetchResult::failed(citation_key, &e);
+            result.reason = Some(file_needed_reason());
+            return Ok(result);
+        }
+        Err(e @ PaxError::Fetch(_)) => return Ok(FetchResult::failed(citation_key, &e)),
         Err(e) => return Err(name_error(e)),
     };
     // The hash is recorded either way; only building the PDF can still fail.
@@ -924,8 +973,8 @@ fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult
                  it in the repository that holds it, then fetch again: {message}"
             ),
         ),
-        Err(e @ PaxError::LocalArtifactMissing(_)) => {
-            not_built(FetchState::FileNeeded, e.to_string())
+        Err(PaxError::LocalArtifactMissing(_)) => {
+            not_built(FetchState::FileNeeded, file_needed_reason())
         }
         Err(e) => not_built(FetchState::BuildFailed, e.to_string()),
         Ok(_) => not_built(
@@ -933,6 +982,22 @@ fn fetch_result(citation_key: &str, attempt: FetchAttempt) -> Result<FetchResult
             "the hash is recorded, but the PDF still couldn't be resolved".to_string(),
         ),
     })
+}
+
+/// `fetch`'s `file`, resolved against the library `root` when relative, or
+/// an error naming it when it can't be opened (missing, or unreadable).
+/// pax-core refuses a path that opens but isn't a file (`NotAFile`).
+fn readable_file(root: &Path, file: &str) -> Result<PathBuf, String> {
+    let path = root.join(file);
+    std::fs::File::open(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// `file-needed`'s reason: pax-core's names the CLI's `--file`.
+fn file_needed_reason() -> String {
+    "this paper was added from a local file, which isn't in this Nix store; fetch again \
+     with `file` set to the PDF's path to provide it again"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -2143,8 +2208,10 @@ mod tests {
         let before = fs::read_to_string(&papers).unwrap();
 
         let Json(result) = server
-            .fetch(Parameters(CitationKeyParams {
+            .fetch(Parameters(FetchParams {
                 reference: "hewitt1973".to_string(),
+                file: None,
+                force: false,
             }))
             .await
             .unwrap();
@@ -2154,8 +2221,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&papers).unwrap(), before);
 
         let unknown = server
-            .fetch(Parameters(CitationKeyParams {
+            .fetch(Parameters(FetchParams {
                 reference: "dijkstra1968".to_string(),
+                file: None,
+                force: false,
             }))
             .await
             .err()
@@ -2226,7 +2295,7 @@ mod tests {
         let missing = PaxError::LocalArtifactMissing("turing1936".to_string());
         let file_needed = fetch_result("turing1936", Err(missing)).unwrap();
         assert_eq!(file_needed.status, FetchState::FileNeeded);
-        assert!(file_needed.reason.unwrap().contains("--file"));
+        assert!(file_needed.reason.unwrap().contains("`file`"));
         let unbuilt = fetch_result(
             "turing1936",
             Ok((
@@ -2241,6 +2310,124 @@ mod tests {
         assert_eq!(unbuilt.hash.as_deref(), Some("sha256-old"));
 
         assert!(fetch_result("x", Err(PaxError::NoSuchPaper("x".to_string()))).is_err());
+    }
+
+    #[test]
+    fn file_fetch_results_point_at_file_and_force() {
+        let no_source = fetch_result(
+            "hewitt1973",
+            Err(PaxError::NoSourceUrl("hewitt1973".to_string())),
+        )
+        .unwrap();
+        assert_eq!(no_source.status, FetchState::NoSourceUrl);
+        let reason = no_source.reason.unwrap();
+        assert!(
+            reason.contains("`file`") && reason.contains("--source-url"),
+            "{reason}"
+        );
+
+        let mismatch = fetch_result(
+            "turing1936",
+            Err(PaxError::HashMismatch {
+                citation_key: "turing1936".to_string(),
+                recorded: "sha256-old".to_string(),
+                actual: "sha256-new".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(mismatch.status, FetchState::HashMismatch);
+        assert!(mismatch.hash.is_none());
+        let reason = mismatch.reason.unwrap();
+        assert!(
+            reason.contains("sha256-old") && reason.contains("sha256-new"),
+            "{reason}"
+        );
+        assert!(reason.contains("`force: true`"), "{reason}");
+
+        let not_a_file = fetch_result("x", Err(PaxError::NotAFile(PathBuf::from("/tmp"))));
+        assert!(not_a_file.unwrap_err().contains("not a file"));
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_bad_file_before_running_nix() {
+        let root = library_with_two_papers("fetch-bad-file");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let before = fs::read_to_string(&papers).unwrap();
+        let fetch = |file: Option<&str>, force| {
+            server.fetch(Parameters(FetchParams {
+                reference: "hewitt1973".to_string(),
+                file: file.map(str::to_string),
+                force,
+            }))
+        };
+
+        let missing = fetch(Some("missing.pdf"), false).await.err().unwrap();
+        assert!(
+            missing.contains(&root.join("missing.pdf").display().to_string()),
+            "{missing}"
+        );
+        // A directory opens, so pax-core is the one refusing it.
+        let directory = fetch(Some("research"), false).await.err().unwrap();
+        assert!(directory.contains("not a file"), "{directory}");
+        let force = fetch(None, true).await.err().unwrap();
+        assert!(force.contains("`file`"), "{force}");
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether `nix` can run here; tests that add files to the Nix store
+    /// are skipped without it.
+    fn nix_available() -> bool {
+        std::process::Command::new("nix")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[tokio::test]
+    async fn fetch_with_a_file_records_its_hash_and_force_replaces_one() {
+        if !nix_available() {
+            eprintln!("skipped: nix isn't available");
+            return;
+        }
+        let root = library_with_two_papers("fetch-file");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let papers = pax_core::nix::papers_path(&root);
+        let pdf = root.join("paper.pdf");
+        fs::write(&pdf, "%PDF-1.4 pax-ai fetch test\n").unwrap();
+        let fetch = |reference: &str, force| {
+            server.fetch(Parameters(FetchParams {
+                reference: reference.to_string(),
+                file: Some("paper.pdf".to_string()),
+                force,
+            }))
+        };
+
+        let Json(added) = fetch("hewitt1973", false).await.unwrap();
+        assert_eq!(added.status, FetchState::Fetched, "{:?}", added.reason);
+        let hash = added.hash.expect("the file's hash");
+        assert!(fs::read_to_string(&papers).unwrap().contains(&hash));
+        assert!(
+            added
+                .store_path
+                .is_some_and(|path| path.starts_with("/nix/store/"))
+        );
+
+        // turing1936 already records another hash.
+        let before = fs::read_to_string(&papers).unwrap();
+        let Json(mismatch) = fetch("turing1936", false).await.unwrap();
+        assert_eq!(mismatch.status, FetchState::HashMismatch);
+        assert!(mismatch.reason.unwrap().contains("force"));
+        assert_eq!(fs::read_to_string(&papers).unwrap(), before);
+
+        let Json(forced) = fetch("turing1936", true).await.unwrap();
+        assert_eq!(forced.status, FetchState::Fetched, "{:?}", forced.reason);
+        assert_eq!(forced.hash.as_deref(), Some(hash.as_str()));
+        assert!(!fs::read_to_string(&papers).unwrap().contains("sha256-AAAA"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2459,8 +2646,10 @@ mod tests {
         assert_eq!(tagged.tags, ["concurrency", "included"]);
 
         let Json(fetched) = server
-            .fetch(Parameters(CitationKeyParams {
+            .fetch(Parameters(FetchParams {
                 reference: "P17".to_string(),
+                file: None,
+                force: false,
             }))
             .await
             .unwrap();
@@ -2610,8 +2799,10 @@ mod tests {
             .expect("edit should refuse an excluded paper's alias");
         assert!(edit.contains("excluded"), "{edit}");
         let fetch = server
-            .fetch(Parameters(CitationKeyParams {
+            .fetch(Parameters(FetchParams {
                 reference: "P18".to_string(),
+                file: None,
+                force: false,
             }))
             .await
             .err()
