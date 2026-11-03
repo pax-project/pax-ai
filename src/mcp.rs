@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
-    ExclusionList, Exported, FetchResult, FetchState, Lists, PaperList, SearchResults, Shown,
+    ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, PaperList, PdfCopyState,
+    SearchResults, Shown,
 };
 use pax_core::{
     CandidateId, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage, FetchOutcome,
@@ -296,11 +297,14 @@ pub struct ListOutput {
     pub excluded: Option<ExclusionList>,
 }
 
-/// The text format `export` renders.
+/// What `export` produces.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
+    /// BibTeX text, returned in the result.
     Bibtex,
+    /// A backup of the PDFs added from local files, written to `dir`.
+    Pdfs,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -308,10 +312,27 @@ pub struct ExportParams {
     pub format: ExportFormat,
     /// Export only these papers, by citation key or alias; every one must be
     /// in the library.
-    /// Without `keys` or `tag`, the whole library is exported.
+    /// Without `keys` or `tag`, the whole library is exported. `bibtex`
+    /// only.
     pub keys: Option<Vec<String>>,
     /// Export only papers with this exact tag (combined with `keys` by AND).
+    /// `bibtex` only.
     pub tag: Option<String>,
+    /// The backup directory, created if needed: an absolute path, or one
+    /// relative to the library root. `pdfs` only, and required with it.
+    pub dir: Option<String>,
+}
+
+/// What `export` returns: pax-core's [`Exported`] (`citation_keys`,
+/// `bibtex`) for `bibtex`, or its [`ExportedPdfs`] (`directory`,
+/// `manifest`, `papers`, and counts) for `pdfs`, the shapes `pax export
+/// bibtex --json` and `pax export pdfs --json` print.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ExportOutput {
+    #[serde(flatten)]
+    pub text: Option<Exported>,
+    #[serde(flatten)]
+    pub pdfs: Option<ExportedPdfs>,
 }
 
 /// What `show` found. For a `reference`, pax-core's [`Shown`]: exactly one of
@@ -645,23 +666,71 @@ impl PaxServer {
         }))
     }
 
-    /// Export declared papers as BibTeX text: the whole library, or only the
-    /// papers named in `keys` (citation keys or aliases) and/or the papers
-    /// with a `tag`. Returns the text (`bibtex`) and the exported papers'
-    /// `citation_keys` instead of writing a file.
+    /// With `format: "bibtex"`, export declared papers as BibTeX text: the
+    /// whole library, or only the papers named in `keys` (citation keys or
+    /// aliases) and/or the papers with a `tag`. Returns the text (`bibtex`)
+    /// and the exported papers' `citation_keys` instead of writing a file.
+    ///
+    /// With `format: "pdfs"`, back up the PDFs added from local files
+    /// (`fetch` with `file`), which exist only in this machine's Nix store
+    /// and can't be downloaded again: each is copied to
+    /// `<dir>/<citation_key>.pdf`, and `<dir>/manifest.json` maps each
+    /// exported citation key to its hash. Papers with a source URL aren't
+    /// included, since Nix downloads them again. Nothing is uploaded: the
+    /// PDFs stay in `dir` on this machine unless the user copies the
+    /// directory elsewhere, so choose one outside `research/`, which pax
+    /// stages in git. A paper whose file isn't in this Nix store is
+    /// reported as `missing` and the rest are still exported.
     #[tool]
     async fn export(
         &self,
         Parameters(params): Parameters<ExportParams>,
-    ) -> Result<Json<Exported>, String> {
-        let library = Library::load(&self.papers_path()?).map_err(|e| e.to_string())?;
+    ) -> Result<Json<ExportOutput>, String> {
+        let papers_path = self.papers_path()?;
+        if let ExportFormat::Pdfs = params.format {
+            if params.keys.is_some() || params.tag.is_some() {
+                return Err(
+                    "`keys` and `tag` select papers for `bibtex`; `pdfs` backs up \
+                            every PDF added from a local file"
+                        .to_string(),
+                );
+            }
+            let dir = match params.dir.as_deref().map(str::trim) {
+                Some(dir) if !dir.is_empty() => self.root.join(dir),
+                _ => return Err("`pdfs` needs `dir`, the backup directory".to_string()),
+            };
+            let root = self.root.clone();
+            let mut exported = tokio::task::spawn_blocking(move || {
+                pax_core::export_pdfs(&root, &dir).map(|export| ExportedPdfs::new(&export))
+            })
+            .await
+            .map_err(|e| format!("export didn't finish: {e}"))?
+            .map_err(|e| e.to_string())?;
+            // pax-core's error names the CLI's commands.
+            for paper in &mut exported.papers {
+                if paper.status == PdfCopyState::Missing {
+                    paper.error = Some(file_needed_reason());
+                }
+            }
+            return Ok(Json(ExportOutput {
+                text: None,
+                pdfs: Some(exported),
+            }));
+        }
+        if params.dir.is_some() {
+            return Err(
+                "`dir` is where `pdfs` writes its backup; `bibtex` returns text".to_string(),
+            );
+        }
+        let library = Library::load(&papers_path).map_err(|e| e.to_string())?;
         let papers = select_papers(
             library.papers(),
             params.keys.as_deref(),
             params.tag.as_deref(),
         )?;
-        Ok(Json(match params.format {
-            ExportFormat::Bibtex => Exported::new(&papers),
+        Ok(Json(ExportOutput {
+            text: Some(Exported::new(&papers)),
+            pdfs: None,
         }))
     }
 
@@ -811,7 +880,9 @@ impl ServerHandler for PaxServer {
                  declared papers (edit), fetch a paper's PDF through Nix \
                  (fetch, which can take minutes), verify fetched PDFs still \
                  reproduce (check), list what's declared or excluded (list), export it as \
-                 BibTeX text (export), and report PRISMA flow counts (stats). \
+                 BibTeX text or back up the PDFs added from local files to a \
+                 directory on this machine (export), and report PRISMA flow \
+                 counts (stats). \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
                  ones): every tool that takes a citation key also takes an \
@@ -2396,7 +2467,15 @@ mod tests {
             format: ExportFormat::Bibtex,
             keys: keys.map(|keys| keys.iter().map(|k| k.to_string()).collect()),
             tag: tag.map(str::to_string),
+            dir: None,
         })
+    }
+
+    /// A `bibtex` export's result.
+    fn bibtex(output: Result<Json<ExportOutput>, String>) -> Exported {
+        let Json(output) = output.unwrap();
+        assert!(output.pdfs.is_none());
+        output.text.expect("a bibtex export")
     }
 
     #[tokio::test]
@@ -2404,7 +2483,7 @@ mod tests {
         let root = library_with_two_papers("export");
         let server = PaxServer::new(root.clone(), Config::default());
 
-        let Json(all) = server.export(export_of(None, None)).await.unwrap();
+        let all = bibtex(server.export(export_of(None, None)).await);
         assert_eq!(all.citation_keys, ["turing1936", "hewitt1973"]);
         assert!(
             all.bibtex.contains("@article{turing1936,"),
@@ -2422,10 +2501,7 @@ mod tests {
             all.bibtex
         );
 
-        let Json(by_key) = server
-            .export(export_of(Some(&["hewitt1973"]), None))
-            .await
-            .unwrap();
+        let by_key = bibtex(server.export(export_of(Some(&["hewitt1973"]), None)).await);
         assert_eq!(by_key.citation_keys, ["hewitt1973"]);
         assert!(!by_key.bibtex.contains("turing1936"));
         assert!(
@@ -2434,16 +2510,14 @@ mod tests {
                 .contains("title = {A Universal Modular Actor Formalism}")
         );
 
-        let Json(by_tag) = server
-            .export(export_of(None, Some("computability")))
-            .await
-            .unwrap();
+        let by_tag = bibtex(server.export(export_of(None, Some("computability"))).await);
         assert_eq!(by_tag.citation_keys, ["turing1936"]);
 
-        let Json(none) = server
-            .export(export_of(Some(&["hewitt1973"]), Some("computability")))
-            .await
-            .unwrap();
+        let none = bibtex(
+            server
+                .export(export_of(Some(&["hewitt1973"]), Some("computability")))
+                .await,
+        );
         assert!(none.citation_keys.is_empty() && none.bibtex.is_empty());
 
         fs::remove_dir_all(root).unwrap();
@@ -2465,6 +2539,85 @@ mod tests {
 
         let ris = serde_json::from_value::<ExportParams>(serde_json::json!({ "format": "ris" }));
         assert!(ris.is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn pdfs_to(dir: Option<&str>) -> Parameters<ExportParams> {
+        Parameters(ExportParams {
+            format: ExportFormat::Pdfs,
+            keys: None,
+            tag: None,
+            dir: dir.map(str::to_string),
+        })
+    }
+
+    /// A `pdfs` export's result.
+    fn pdfs(output: Result<Json<ExportOutput>, String>) -> ExportedPdfs {
+        let Json(output) = output.unwrap();
+        assert!(output.text.is_none());
+        output.pdfs.expect("a pdfs export")
+    }
+
+    /// Clears the fixture's hashes, so it has no local artifact (turing1936's
+    /// hash has no `source_url`) and pax-core runs no `nix` for it.
+    fn without_hashes(root: &Path) {
+        let papers = pax_core::nix::papers_path(root);
+        let text = fs::read_to_string(&papers)
+            .unwrap()
+            .replace(r#"hash = "sha256-AAAA";"#, "hash = null;");
+        fs::write(&papers, text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_pdfs_needs_a_dir_and_selects_no_papers() {
+        let root = library_with_two_papers("export-pdfs-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        for dir in [None, Some(""), Some("  ")] {
+            let error = server.export(pdfs_to(dir)).await.err().unwrap();
+            assert!(error.contains("`dir`"), "{error}");
+        }
+        let mut selected = pdfs_to(Some("backup"));
+        selected.0.tag = Some("computability".to_string());
+        let error = server.export(selected).await.err().unwrap();
+        assert!(error.contains("`tag`"), "{error}");
+        let mut bibtex_to_dir = export_of(None, None);
+        bibtex_to_dir.0.dir = Some("backup".to_string());
+        let error = server.export(bibtex_to_dir).await.err().unwrap();
+        assert!(error.contains("`dir`"), "{error}");
+        assert!(!root.join("backup").exists());
+
+        let parsed: ExportParams =
+            serde_json::from_value(serde_json::json!({ "format": "pdfs", "dir": "backup" }))
+                .unwrap();
+        assert!(matches!(parsed.format, ExportFormat::Pdfs));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_pdfs_leaves_out_papers_nix_can_download() {
+        let root = library_with_two_papers("export-pdfs-none");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let exported = pdfs(server.export(pdfs_to(Some("backup/nested"))).await);
+        let dir = root.join("backup/nested");
+        assert_eq!(exported.directory, dir.display().to_string());
+        assert_eq!(
+            exported.manifest,
+            dir.join("manifest.json").display().to_string()
+        );
+        assert!(exported.papers.is_empty());
+        assert_eq!(
+            (exported.exported, exported.missing, exported.failed),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("manifest.json")).unwrap(),
+            "{}\n"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2782,6 +2935,60 @@ mod tests {
         assert!(!fs::read_to_string(&papers).unwrap().contains("sha256-AAAA"));
     }
 
+    /// Adds `content` as `reference`'s PDF through `fetch`'s `file`, tracking
+    /// its store path in `scratch`, and returns its hash.
+    async fn add_local_pdf(
+        server: &PaxServer,
+        scratch: &mut StoreScratch,
+        reference: &str,
+        content: &str,
+    ) -> String {
+        let file = format!("{reference}-source.pdf");
+        fs::write(scratch.root.join(&file), content).unwrap();
+        let Json(added) = server
+            .fetch(Parameters(FetchParams {
+                reference: reference.to_string(),
+                file: Some(file),
+                force: false,
+            }))
+            .await
+            .unwrap();
+        scratch.track(added.store_path.as_deref());
+        assert_eq!(added.status, FetchState::Fetched, "{:?}", added.reason);
+        added.hash.expect("the file's hash")
+    }
+
+    #[tokio::test]
+    async fn export_pdfs_copies_local_artifacts_and_writes_a_manifest() {
+        if !nix_available() {
+            eprintln!("skipped: nix isn't available");
+            return;
+        }
+        let mut scratch = StoreScratch::new(library_with_two_papers("export-pdfs"));
+        let root = scratch.root.clone();
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        let content = "%PDF-1.4 pax-ai export test\n";
+        let hash = add_local_pdf(&server, &mut scratch, "hewitt1973", content).await;
+
+        let dir = root.join("backup");
+        let exported = pdfs(server.export(pdfs_to(Some(dir.to_str().unwrap()))).await);
+        assert_eq!(
+            (exported.exported, exported.missing, exported.failed),
+            (1, 0, 0)
+        );
+        let copy = &exported.papers[0];
+        assert_eq!(copy.citation_key, "hewitt1973");
+        assert_eq!(copy.status, PdfCopyState::Exported);
+        assert_eq!(copy.hash, hash);
+        let file = dir.join("hewitt1973.pdf");
+        assert_eq!(copy.file.as_deref(), Some(file.to_str().unwrap()));
+        assert_eq!(fs::read_to_string(&file).unwrap(), content);
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest, serde_json::json!({ "hewitt1973": hash }));
+    }
+
     #[tokio::test]
     async fn blocking_work_past_its_timeout_is_reported_as_none() {
         let slow = blocking_with_timeout(Duration::from_millis(10), || {
@@ -3008,14 +3215,16 @@ mod tests {
         assert_eq!(fetched.citation_key, "hewitt1973");
         assert_eq!(fetched.status, FetchState::NoSourceUrl);
 
-        let Json(exported) = server
-            .export(Parameters(ExportParams {
-                format: ExportFormat::Bibtex,
-                keys: Some(vec!["P17".to_string()]),
-                tag: None,
-            }))
-            .await
-            .unwrap();
+        let exported = bibtex(
+            server
+                .export(Parameters(ExportParams {
+                    format: ExportFormat::Bibtex,
+                    keys: Some(vec!["P17".to_string()]),
+                    tag: None,
+                    dir: None,
+                }))
+                .await,
+        );
         assert_eq!(exported.citation_keys, ["hewitt1973"]);
 
         let Json(refs) = server
