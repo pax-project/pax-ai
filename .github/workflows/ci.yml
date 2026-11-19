@@ -7,4 +7,4 @@ on:
 
 jobs:
   quality-gate:
-    uses: pax-project/.github/.github/workflows/rust-ci.yml@main
+    uses: pax-project/.github/.github/workflows/rust-ci.yml@ci/cache-nix-and-cargo
