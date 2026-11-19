@@ -96,7 +96,7 @@ impl PaperIndex {
     /// what changed. One paper's failure is that paper's report, never the
     /// run's; only a `papers.nix` that can't be read is an error. Ends by
     /// pruning the store of every entry the current `papers.nix` doesn't
-    /// imply (for this model).
+    /// imply for this embedder's model, another model's entries included.
     ///
     /// The `nix` call that resolves a PDF and `pdftotext` run on tokio's
     /// blocking pool, each with a timeout, so this must run on a tokio
