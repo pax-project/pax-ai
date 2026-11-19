@@ -7,6 +7,7 @@
 //! manifest: both load `papers.nix` through pax-core and work out each
 //! paper's store keys, so `papers.nix` alone decides what's indexed.
 
+pub mod candidates;
 pub mod chunk;
 pub mod extract;
 pub mod similarity;
