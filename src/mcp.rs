@@ -14,7 +14,9 @@
 //! `semantic_search` ranks over that index and returns its
 //! [`SemanticResults`]. `rank_candidates` scores provider candidates
 //! against one indexed library paper, and returns pax-core's
-//! [`MergedHit`]s with their scores.
+//! [`MergedHit`]s with their scores; `rank_by` on `search`, `refs`,
+//! `cited_by` and `related` adds the same scores to their results as
+//! `ranking` ([`RankedOutput`]), which is otherwise left out.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -35,9 +37,9 @@ use pax_core::output::{
 };
 use pax_core::{
     CandidateId, CandidateWork, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage,
-    FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper,
-    PaperEdits, PaxError, ProviderError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage,
-    SeedResults, Stats, SyncReport, YearRange,
+    FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter, Logged, MergedWork,
+    NameHolder, Paper, PaperEdits, PaxError, ProviderError, ProviderId, ResolvedArtifact,
+    SearchOptions, SearchPage, SeedResults, Stats, SyncReport, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -124,8 +126,47 @@ pub struct SearchParams {
     pub query: Option<String>,
     /// Author name, for an author-scoped search instead of free text.
     pub author: Option<String>,
+    /// Rank the returned results by how close in content each is to this
+    /// library paper (a citation key or alias, which must be in the
+    /// embedding index): see `ranking` in the result. Turns
+    /// `with_abstracts` on.
+    pub rank_by: Option<String>,
     #[serde(flatten)]
     pub paging: PagingParams,
+}
+
+/// What `search`, `refs`, `cited_by` and `related` return: pax-core's
+/// shape ([`SearchResults`] or [`CitationResults`]) flattened, plus
+/// `ranking` when asked for with `rank_by`; without it, exactly pax-core's
+/// shape, as the CLI's `--json` prints it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RankedOutput<T> {
+    #[serde(flatten)]
+    pub output: T,
+    /// With `rank_by`: every returned paper, by its `id`, best first, with
+    /// its score against the `rank_by` paper (higher is closer, at most 1;
+    /// not comparable with `similar`'s scores) and whether its abstract was
+    /// embedded (otherwise only its title was). Absent without `rank_by`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<Vec<RankingEntry>>,
+}
+
+/// The results read as pax-core's own shape.
+impl<T> std::ops::Deref for RankedOutput<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.output
+    }
+}
+
+/// One paper's place in a `rank_by` ranking.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct RankingEntry {
+    /// The paper's `id` in the results.
+    pub id: String,
+    pub score: f32,
+    pub had_abstract: bool,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -139,8 +180,21 @@ pub struct CitationParams {
     /// each seed is reported on its own, and the results are merged across
     /// every seed.
     pub references: Option<Vec<String>>,
+    /// Rank the returned papers by how close in content each is to this
+    /// library paper (a citation key or alias, which must be in the
+    /// embedding index): see `ranking` in the result. Turns
+    /// `with_abstracts` on.
+    pub rank_by: Option<String>,
     #[serde(flatten)]
     pub paging: PagingParams,
+}
+
+/// Which seed lookup a citation tool runs.
+#[derive(Debug, Clone, Copy)]
+enum CitationTool {
+    Refs,
+    CitedBy,
+    Related,
 }
 
 impl CitationParams {
@@ -520,24 +574,16 @@ impl PaxServer {
     /// the library or excluded. Any result `id` works with `show` and `add`.
     /// `with_abstracts` adds each paper's `abstract`, making the response
     /// several times larger. The search is recorded in the library's search
-    /// log, under `label` when given.
+    /// log, under `label` when given. `rank_by` (a library paper in the
+    /// embedding index) also ranks the returned page by closeness in
+    /// content to that paper, in `ranking`, with abstracts on; to rank
+    /// more, fetch more pages.
     #[tool]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
-    ) -> Result<Json<SearchResults>, String> {
-        let options = params.paging.options()?;
-        let (root, config) = (&self.root, &self.config);
-        let logged = match (params.query, params.author) {
-            (Some(query), None) => {
-                pax_core::search_all_logged(&query, &options, root, config).await
-            }
-            (None, Some(author)) => {
-                pax_core::search_by_author_logged(&author, &options, root, config).await
-            }
-            _ => return Err("give exactly one of `query` or `author`".to_string()),
-        };
-        Ok(Json(self.results(logged, options.abstracts)))
+    ) -> Result<Json<RankedOutput<SearchResults>>, String> {
+        self.search_with(self.embedder.as_ref(), params).await
     }
 
     /// The papers one or more seed papers cite (backward snowballing), from
@@ -553,58 +599,48 @@ impl PaxServer {
     /// retrieval; ask again with a higher `limit` or `all`.
     /// `with_abstracts` adds each paper's `abstract`, making the response
     /// several times larger. Recorded in the library's search log, under
-    /// `label` when given.
+    /// `label` when given. `rank_by` ranks the returned papers as in
+    /// `search`.
     #[tool]
     async fn refs(
         &self,
         Parameters(params): Parameters<CitationParams>,
-    ) -> Result<Json<CitationResults>, String> {
-        let options = params.paging.options()?;
-        let seeds = params.seeds()?;
-        let logged =
-            pax_core::references_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged, Lists::Citations, options.abstracts)
-            .map(Json)
+    ) -> Result<Json<RankedOutput<CitationResults>>, String> {
+        self.citations_with(self.embedder.as_ref(), params, CitationTool::Refs)
+            .await
     }
 
     /// The papers citing one or more seed papers (forward snowballing);
-    /// otherwise as `refs`, `with_abstracts` included (responses several
-    /// times larger). A paper's own text can't list what cites it, so a
-    /// missing list here has no fallback but the other provider's.
+    /// otherwise as `refs`, `with_abstracts` and `rank_by` included
+    /// (responses several times larger). A paper's own text can't list what
+    /// cites it, so a missing list here has no fallback but the other
+    /// provider's.
     #[tool]
     async fn cited_by(
         &self,
         Parameters(params): Parameters<CitationParams>,
-    ) -> Result<Json<CitationResults>, String> {
-        let options = params.paging.options()?;
-        let seeds = params.seeds()?;
-        let logged =
-            pax_core::cited_by_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged, Lists::Citations, options.abstracts)
-            .map(Json)
+    ) -> Result<Json<RankedOutput<CitationResults>>, String> {
+        self.citations_with(self.embedder.as_ref(), params, CitationTool::CitedBy)
+            .await
     }
 
     /// The papers the providers themselves recommend as related to one or
     /// more seed papers: OpenAlex's related works and Semantic Scholar's
     /// recommendations. They aren't citation edges, so they reach beyond the
     /// seeds' citation neighbourhood and make a snowballing start set more
-    /// varied. Input and output are as `refs`, `with_abstracts` and `label`
-    /// included. Recommendations have no total, so a related list is never
-    /// exhaustive: `incomplete` names only the missing lists (`failed`,
-    /// `unresolved`), and `complete` means no list is missing, not that
-    /// every related paper was returned. Recorded in the library's search
-    /// log, and counted in `stats` as `identified.related_works`.
+    /// varied. Input and output are as `refs`, `with_abstracts`, `label`
+    /// and `rank_by` included. Recommendations have no total, so a related
+    /// list is never exhaustive: `incomplete` names only the missing lists
+    /// (`failed`, `unresolved`), and `complete` means no list is missing,
+    /// not that every related paper was returned. Recorded in the library's
+    /// search log, and counted in `stats` as `identified.related_works`.
     #[tool]
     async fn related(
         &self,
         Parameters(params): Parameters<CitationParams>,
-    ) -> Result<Json<CitationResults>, String> {
-        let options = params.paging.options()?;
-        let seeds = params.seeds()?;
-        let logged =
-            pax_core::related_many_logged(&seeds, &options, &self.root, &self.config).await;
-        self.citations(logged, Lists::Related, options.abstracts)
-            .map(Json)
+    ) -> Result<Json<RankedOutput<CitationResults>>, String> {
+        self.citations_with(self.embedder.as_ref(), params, CitationTool::Related)
+            .await
     }
 
     /// Show one paper: by a provider reference from `search` (resolved live),
@@ -1367,27 +1403,120 @@ impl PaxServer {
         Ok(path)
     }
 
-    /// A logged search's results, flagged against the library as it is now,
-    /// with each paper's abstract when `abstracts` were asked for.
-    fn results<E: Display>(
+    /// The `rank_by` seed's vectors, if one was given, refused before any
+    /// provider is asked when it isn't indexed.
+    fn rank_by_seed(
         &self,
+        embedder: &impl Embedder,
+        rank_by: Option<&str>,
+    ) -> Result<Option<PaperVectors>, String> {
+        rank_by
+            .map(|name| self.ranking_seed(embedder.model_id(), "rank_by", name))
+            .transpose()
+    }
+
+    /// `search` with `embedder` for `rank_by`, so tests can refuse a seed
+    /// offline.
+    async fn search_with(
+        &self,
+        embedder: &impl Embedder,
+        params: SearchParams,
+    ) -> Result<Json<RankedOutput<SearchResults>>, String> {
+        let options = params.paging.options()?;
+        let (root, config) = (&self.root, &self.config);
+        let (query, by_author) = match (params.query, params.author) {
+            (Some(query), None) => (query, false),
+            (None, Some(author)) => (author, true),
+            _ => return Err("give exactly one of `query` or `author`".to_string()),
+        };
+        let seed = self.rank_by_seed(embedder, params.rank_by.as_deref())?;
+        let options = match seed {
+            Some(_) => options.with_abstracts(true),
+            None => options,
+        };
+        let logged = if by_author {
+            pax_core::search_by_author_logged(&query, &options, root, config).await
+        } else {
+            pax_core::search_all_logged(&query, &options, root, config).await
+        };
+        self.results(embedder, seed.as_ref(), logged, options.abstracts)
+            .await
+            .map(Json)
+    }
+
+    /// `refs`, `cited_by` or `related` with `embedder` for `rank_by`, so
+    /// tests can rank offline.
+    async fn citations_with(
+        &self,
+        embedder: &impl Embedder,
+        mut params: CitationParams,
+        tool: CitationTool,
+    ) -> Result<Json<RankedOutput<CitationResults>>, String> {
+        let options = params.paging.options()?;
+        let rank_by = params.rank_by.take();
+        let seeds = params.seeds()?;
+        let seed = self.rank_by_seed(embedder, rank_by.as_deref())?;
+        let options = match seed {
+            Some(_) => options.with_abstracts(true),
+            None => options,
+        };
+        let (root, config) = (&self.root, &self.config);
+        let (logged, lists) = match tool {
+            CitationTool::Refs => (
+                pax_core::references_many_logged(&seeds, &options, root, config).await,
+                Lists::Citations,
+            ),
+            CitationTool::CitedBy => (
+                pax_core::cited_by_many_logged(&seeds, &options, root, config).await,
+                Lists::Citations,
+            ),
+            CitationTool::Related => (
+                pax_core::related_many_logged(&seeds, &options, root, config).await,
+                Lists::Related,
+            ),
+        };
+        self.citations(embedder, seed.as_ref(), logged, lists, options.abstracts)
+            .await
+            .map(Json)
+    }
+
+    /// A logged search's results, flagged against the library as it is now,
+    /// with each paper's abstract when `abstracts` were asked for, ranked
+    /// against `seed` when there is one.
+    async fn results<E: Display>(
+        &self,
+        embedder: &impl Embedder,
+        seed: Option<&PaperVectors>,
         logged: Logged<HashMap<ProviderId, Result<SearchPage, E>>>,
         abstracts: bool,
-    ) -> SearchResults {
+    ) -> Result<RankedOutput<SearchResults>, String> {
         let Logged { results, log, .. } = logged;
+        let ranking = match seed {
+            Some(seed) => {
+                let merged = pax_core::merge_pages(&results);
+                Some(rank_merged(embedder, seed, merged.works.iter()).await?)
+            }
+            None => None,
+        };
         let index = LibraryIndex::load(&self.root);
-        SearchResults::new(&results, &index, &log, abstracts)
+        Ok(RankedOutput {
+            output: SearchResults::new(&results, &index, &log, abstracts),
+            ranking,
+        })
     }
 
     /// A logged multi-seed citation lookup's results, flagged against the
-    /// library as it is now. When no seed was valid, no provider was asked
-    /// and nothing was logged, so it's an error naming each seed's problem.
-    fn citations(
+    /// library as it is now, and ranked against `seed` when there is one.
+    /// When no seed was valid, no provider was asked and nothing was logged,
+    /// so it's an error naming each seed's problem.
+    async fn citations(
         &self,
+        embedder: &impl Embedder,
+        seed: Option<&PaperVectors>,
         logged: Logged<SeedResults>,
         lists: Lists,
         abstracts: bool,
-    ) -> Result<CitationResults, String> {
+    ) -> Result<RankedOutput<CitationResults>, String> {
         let Logged { results, log, .. } = logged;
         let invalid: Vec<String> = results
             .seeds
@@ -1397,11 +1526,53 @@ impl PaxServer {
         if invalid.len() == results.seeds.len() {
             return Err(invalid.join("; "));
         }
+        let ranking = match seed {
+            Some(seed) => {
+                let merged = results.merge();
+                let works = merged.works.iter().map(|work| &work.merged);
+                Some(rank_merged(embedder, seed, works).await?)
+            }
+            None => None,
+        };
         let index = LibraryIndex::load(&self.root);
-        Ok(CitationResults::new(
-            &results, &index, &log, lists, abstracts,
-        ))
+        Ok(RankedOutput {
+            output: CitationResults::new(&results, &index, &log, lists, abstracts),
+            ranking,
+        })
     }
+}
+
+/// `merged` (as pax-core merges a result list, so in its order) scored
+/// against `seed`, best first, each by its representative record's `id`
+/// and embedded with the group's abstract.
+async fn rank_merged<'a>(
+    embedder: &impl Embedder,
+    seed: &PaperVectors,
+    merged: impl Iterator<Item = &'a MergedWork>,
+) -> Result<Vec<RankingEntry>, String> {
+    let works: Vec<CandidateWork> = merged
+        .map(|merged| {
+            let mut work = merged.work.clone();
+            work.abstract_text = merged.abstract_text().map(str::to_string);
+            work
+        })
+        .collect();
+    let scores = score_candidates(embedder, seed, &works)
+        .await
+        .map_err(|e| {
+            format!(
+                "the search ran and was logged, but embedding its results to rank them \
+             failed: {e}"
+            )
+        })?;
+    Ok(best_first(&scores)
+        .into_iter()
+        .map(|i| RankingEntry {
+            id: works[i].id.to_string(),
+            score: scores[i].score,
+            had_abstract: scores[i].had_abstract,
+        })
+        .collect())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1433,7 +1604,8 @@ impl ServerHandler for PaxServer {
                  each with its best-matching passage (semantic_search). \
                  Rank papers that aren't in the library, such as search \
                  results, by how close in content each is to an indexed \
-                 library paper (rank_candidates). \
+                 library paper (rank_candidates, or `rank_by` on search, refs, \
+                 cited_by and related to rank the page they return). \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
                  ones): every tool that takes a citation key also takes an \
@@ -4514,6 +4686,210 @@ mod tests {
             reason.contains("openalex") && reason.contains("timed out"),
             "{reason}"
         );
+    }
+
+    fn ranked_seeds(seed: &str, rank_by: Option<&str>) -> CitationParams {
+        CitationParams {
+            reference: Some(seed.to_string()),
+            rank_by: rank_by.map(str::to_string),
+            ..CitationParams::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_by_refuses_an_unindexed_seed_before_any_provider_call() {
+        let root = library_with_two_papers("rank-by-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let embedder = FakeEmbedder::new();
+        let log = root.join("research/search-log.jsonl");
+
+        for (rank_by, expected) in [
+            ("hewitt1973", "run `index` first"),
+            (" ", "`rank_by`"),
+            ("nobody", "nobody"),
+        ] {
+            let params = SearchParams {
+                query: Some("actors".to_string()),
+                rank_by: Some(rank_by.to_string()),
+                ..SearchParams::default()
+            };
+            let Err(error) = server.search_with(&embedder, params).await else {
+                panic!("searched with rank_by {rank_by:?}");
+            };
+            assert!(error.contains(expected), "{error}");
+            for tool in [
+                CitationTool::Refs,
+                CitationTool::CitedBy,
+                CitationTool::Related,
+            ] {
+                // hewitt1973 would resolve offline and be logged, were the
+                // seed not refused first.
+                let params = ranked_seeds("hewitt1973", Some(rank_by));
+                let Err(error) = server.citations_with(&embedder, params, tool).await else {
+                    panic!("{tool:?} ran with rank_by {rank_by:?}");
+                };
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+        assert!(!log.exists(), "nothing was searched, so nothing is logged");
+        assert!(embedder.kinds.lock().unwrap().is_empty());
+
+        // Paging is still checked first, as without `rank_by`.
+        let params = CitationParams {
+            paging: PagingParams {
+                limit: Some(0),
+                ..PagingParams::default()
+            },
+            ..ranked_seeds("hewitt1973", Some("hewitt1973"))
+        };
+        let Err(error) = server
+            .citations_with(&embedder, params, CitationTool::Refs)
+            .await
+        else {
+            panic!("accepted a zero limit");
+        };
+        assert!(error.contains("`limit`"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rank_by_adds_a_ranking_and_leaves_the_rest_as_without_it() {
+        let (root, server) = indexed_library("rank-by-citations").await;
+        let embedder = FakeEmbedder::new();
+        let log = root.join("research/search-log.jsonl");
+
+        // hewitt1973 has no DOI, so no provider is asked and no paper
+        // comes back, but the lookup is logged.
+        let Json(plain) = server
+            .citations_with(
+                &embedder,
+                ranked_seeds("hewitt1973", None),
+                CitationTool::Refs,
+            )
+            .await
+            .unwrap();
+        assert!(plain.ranking.is_none());
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&plain.output).unwrap(),
+            "without rank_by, the output is pax-core's shape exactly"
+        );
+        let logged = fs::read_to_string(&log).unwrap().lines().count();
+
+        let Json(ranked) = server
+            .citations_with(
+                &embedder,
+                ranked_seeds("hewitt1973", Some("P17")),
+                CitationTool::Related,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ranked.ranking.as_deref(), Some(&[][..]));
+        assert!(ranked.log.logged);
+        assert!(fs::read_to_string(&log).unwrap().lines().count() > logged);
+        let json = serde_json::to_value(&ranked).unwrap();
+        assert_eq!(json["ranking"], serde_json::json!([]));
+        assert_eq!(json["seeds"][0]["seed"], "hewitt1973");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ranked_page_scores_each_merged_paper_with_its_groups_abstract() {
+        let (root, server) = indexed_library("rank-by-page").await;
+        let seed = server
+            .ranking_seed("fake:model", "rank_by", "hewitt1973")
+            .unwrap();
+        let actor_doi = "10.1/actors";
+        let mut abstractless = work(
+            ProviderId::OpenAlex,
+            "W1",
+            "Actor Systems in Practice",
+            Some(actor_doi),
+        );
+        abstractless.venue = Some("IJCAI".to_string());
+        let mut described = work(
+            ProviderId::SemanticScholar,
+            "S1",
+            "Actor Systems in Practice",
+            Some(actor_doi),
+        );
+        described.abstract_text = Some("Actors exchange messages.".to_string());
+        let results: HashMap<ProviderId, Result<SearchPage, ProviderError>> = HashMap::from([
+            (
+                ProviderId::OpenAlex,
+                Ok(SearchPage::new(
+                    vec![
+                        abstractless,
+                        work(
+                            ProviderId::OpenAlex,
+                            "W2",
+                            "A Universal Modular Actor Formalism",
+                            None,
+                        ),
+                    ],
+                    Some(2),
+                    None,
+                )),
+            ),
+            (
+                ProviderId::SemanticScholar,
+                Ok(SearchPage::new(vec![described], Some(1), None)),
+            ),
+        ]);
+        let embedder = FakeEmbedder::new();
+
+        let merged = pax_core::merge_pages(&results);
+        let ranking = rank_merged(&embedder, &seed, merged.works.iter())
+            .await
+            .unwrap();
+
+        let index = LibraryIndex::load(&root);
+        let page = SearchResults::new(&results, &index, &LogOutcome::NoLibrary, true);
+        let mut ids: Vec<&str> = page
+            .results
+            .iter()
+            .map(|hit| hit.work.id.as_str())
+            .collect();
+        let mut ranked: Vec<&str> = ranking.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ranked.len(), 2, "one entry per merged paper: {ranking:?}");
+        // W2's title alone is exactly the seed's title + venue text; the
+        // merged W1 carries Semantic Scholar's abstract.
+        assert_eq!(
+            ranking[0],
+            RankingEntry {
+                id: "openalex:W2".to_string(),
+                score: ranking[0].score,
+                had_abstract: false,
+            }
+        );
+        assert!((ranking[0].score - 1.0).abs() < 1e-5, "{ranking:?}");
+        assert!(ranking[1].had_abstract && ranking[1].score < ranking[0].score);
+        ids.sort();
+        ranked.sort();
+        assert_eq!(ids, ranked, "the ranking names the page's own ids");
+
+        let output = RankedOutput {
+            output: page.clone(),
+            ranking: Some(ranking),
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["ranking"][0]["id"], "openalex:W2");
+        assert_eq!(
+            json["results"],
+            serde_json::to_value(&page).unwrap()["results"]
+        );
+        let unranked = RankedOutput {
+            output: page.clone(),
+            ranking: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&unranked).unwrap(),
+            serde_json::to_string(&page).unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn alias(reference: &str, alias: &str) -> Parameters<EditParams> {
