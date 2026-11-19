@@ -42,8 +42,14 @@
         PARAMETER num_ctx 8192
       '';
 
+      # Runtime tools `pax-mcp` shells out to: poppler's `pdftotext` extracts
+      # a paper's full text for the embedding index (src/index/extract.rs).
+      runtime_deps = [ pkgs.poppler-utils ];
+
       # `nix run` and `lib.getExe` find the `pax-mcp` binary through
-      # mainProgram; the package is named after the crate (pax-ai).
+      # mainProgram; the package is named after the crate (pax-ai). The
+      # binary is wrapped with `runtime_deps` on its PATH, so a consumer of
+      # the package or the home-manager module needs nothing else installed.
       pax-mcp =
         (naerskLib.buildPackage {
           src = ./.;
@@ -51,6 +57,11 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
         }).overrideAttrs
           (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.makeWrapper ];
+            # naersk leaves `postInstall` as `false`, so there's nothing to append to.
+            postInstall = ''
+              wrapProgram $out/bin/pax-mcp --prefix PATH : ${pkgs.lib.makeBinPath runtime_deps}
+            '';
             meta = (old.meta or { }) // {
               description = "MCP server exposing pax-core's library tools";
               mainProgram = "pax-mcp";
@@ -106,7 +117,8 @@
             cargo-audit
             jq
           ]
-          ++ app_deps;
+          ++ app_deps
+          ++ runtime_deps;
         env.RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
         # Wire the repo's git hooks (see .githooks/) in automatically on
         # shell activation, so the quality gate runs the same way whether
