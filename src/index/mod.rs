@@ -257,6 +257,75 @@ impl PaperIndex {
     }
 }
 
+/// One paper [`PaperIndex::similar`] recommends.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct SimilarPaper {
+    pub citation_key: String,
+    /// The paper's chunk-set similarity to the seed.
+    pub score: f32,
+    /// Only its title + venue vector is indexed, so its score compares less.
+    pub fallback: bool,
+}
+
+/// The papers most similar to a seed paper, by their indexed vectors.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct Similar {
+    /// The seed's citation key.
+    pub seed: String,
+    pub seed_fallback: bool,
+    /// Best first, at most `limit`, never the seed.
+    pub papers: Vec<SimilarPaper>,
+    /// Citation keys of the declared papers not indexed for this model,
+    /// the seed included when it isn't.
+    pub unindexed: Vec<String>,
+}
+
+impl PaperIndex {
+    /// The `limit` declared papers most similar to the one `name` names.
+    ///
+    /// `name` is a citation key or alias, resolved as `vectors` does. Scores are
+    /// `chunk_set_similarity`. An unindexed seed gives empty `papers`.
+    /// Equal scores keep `papers.nix` order. Reads only the store: nothing
+    /// is embedded.
+    pub fn similar(&self, model_id: &str, name: &str, limit: usize) -> Result<Similar, PaxError> {
+        let seed = self.vectors(model_id, name)?;
+        let all = self.all_vectors(model_id)?;
+        let unindexed = all
+            .iter()
+            .filter(|paper| paper.chunks.is_empty())
+            .map(|paper| paper.citation_key.clone())
+            .collect();
+        let mut papers = Vec::new();
+        if !seed.chunks.is_empty() {
+            let seed_set = vector_set(&seed);
+            papers = all
+                .iter()
+                .filter(|paper| paper.citation_key != seed.citation_key && !paper.chunks.is_empty())
+                .map(|paper| SimilarPaper {
+                    citation_key: paper.citation_key.clone(),
+                    score: similarity::chunk_set_similarity(&seed_set, &vector_set(paper)),
+                    fallback: paper.fallback,
+                })
+                .collect();
+            papers.sort_by(|a, b| b.score.total_cmp(&a.score));
+            papers.truncate(limit);
+        }
+        Ok(Similar {
+            seed: seed.citation_key,
+            seed_fallback: seed.fallback,
+            papers,
+            unindexed,
+        })
+    }
+}
+
+/// A paper's vectors, as the similarity functions take them.
+fn vector_set(paper: &PaperVectors) -> Vec<&[f32]> {
+    paper.chunks.iter().map(|c| c.vector.as_slice()).collect()
+}
+
 const NOT_FETCHED: &str = "the PDF hasn't been fetched yet";
 const NO_SOURCE_URL: &str = "no PDF source is recorded, so there's no PDF to index";
 const LOCAL_MISSING: &str =
@@ -650,6 +719,136 @@ pub(crate) mod tests {
     async fn an_unreadable_library_is_an_error() {
         let index = PaperIndex::open(Path::new("/nonexistent/pax-ai-index"));
         assert!(index.build(&FakeEmbedder::new()).await.is_err());
+    }
+
+    /// Stores `title_venue` as the paper's title + venue vector (for a
+    /// paper titled `title`, with no venue) and, when given, `full_text`'s
+    /// vectors as the full-text chunks of its hash.
+    fn store_vectors(
+        index: &PaperIndex,
+        title: &str,
+        title_venue: Vec<f32>,
+        full_text: Option<(&str, Vec<Vec<f32>>)>,
+    ) {
+        let stored = |vectors: Vec<Vec<f32>>| Entry {
+            chunks: vectors
+                .into_iter()
+                .map(|vector| StoredChunk {
+                    text: title.to_string(),
+                    vector,
+                })
+                .collect(),
+        };
+        let key = EntryKey::TitleVenue {
+            model_id: "fake:model".to_string(),
+            text: title.to_string(),
+        };
+        index.store.put(&key, &stored(vec![title_venue]));
+        if let Some((hash, chunks)) = full_text {
+            let key = EntryKey::FullText {
+                model_id: "fake:model".to_string(),
+                artifact_hash: hash.to_string(),
+                extractor_version: extract::EXTRACTOR_VERSION,
+                chunker_version: chunk::CHUNKER_VERSION,
+            };
+            index.store.put(&key, &stored(chunks));
+        }
+    }
+
+    /// A seed with full text (aliased `P1`), a full-text match, a fallback
+    /// paper and an unindexed one, stored without the embedder or `nix`.
+    fn similar_library(name: &str) -> (Scratch, PaperIndex) {
+        let with_hash = |key: &str, title: &str, hash: &str| {
+            paper(key, title, None, None).replace("hash = null", &format!("hash = \"{hash}\""))
+        };
+        let seed = with_hash("a2020", "Attention", "sha256-AAAA")
+            .replace("notes = null;", "notes = null;\n    alias = \"P1\";");
+        let scratch = library(name, &[]);
+        write_papers(
+            &scratch.0,
+            &[
+                paper("c2020", "Capsules", None, None),
+                seed,
+                paper("d2020", "Dropout", None, None),
+                with_hash("b2020", "Bert", "sha256-BBBB"),
+            ],
+        );
+        let index = PaperIndex::open(&scratch.0);
+        store_vectors(
+            &index,
+            "Attention",
+            vec![1.0, 0.0],
+            Some(("sha256-AAAA", vec![vec![1.0, 0.0], vec![0.0, 1.0]])),
+        );
+        store_vectors(
+            &index,
+            "Bert",
+            vec![1.0, 0.0],
+            Some(("sha256-BBBB", vec![vec![0.0, 1.0]])),
+        );
+        store_vectors(&index, "Capsules", vec![0.0, 1.0], None);
+        (scratch, index)
+    }
+
+    #[test]
+    fn similar_ranks_by_chunk_set_similarity_and_lists_the_unindexed() {
+        let (_scratch, index) = similar_library("similar");
+
+        let similar = index.similar("fake:model", "P1", 10).unwrap();
+        assert_eq!(similar.seed, "a2020");
+        assert!(!similar.seed_fallback);
+        // Bert matches every seed vector exactly both ways; Capsules matches
+        // one of the seed's three, and the seed matches it: (1/3 + 1) / 2.
+        let ranked: Vec<(&str, bool)> = similar
+            .papers
+            .iter()
+            .map(|p| (p.citation_key.as_str(), p.fallback))
+            .collect();
+        assert_eq!(ranked, [("b2020", false), ("c2020", true)]);
+        assert!((similar.papers[0].score - 1.0).abs() < 1e-5);
+        assert!((similar.papers[1].score - 2.0 / 3.0).abs() < 1e-5);
+        assert_eq!(similar.unindexed, ["d2020"]);
+
+        let top = index.similar("fake:model", "a2020", 1).unwrap();
+        assert_eq!(top.papers.len(), 1);
+        assert_eq!(top.papers[0].citation_key, "b2020");
+    }
+
+    #[test]
+    fn a_fallback_seed_still_finds_papers() {
+        let (_scratch, index) = similar_library("similar-fallback");
+
+        let similar = index.similar("fake:model", "c2020", 10).unwrap();
+        assert!(similar.seed_fallback);
+        let keys: Vec<&str> = similar
+            .papers
+            .iter()
+            .map(|p| p.citation_key.as_str())
+            .collect();
+        assert_eq!(keys, ["b2020", "a2020"]);
+    }
+
+    #[test]
+    fn an_unindexed_seed_gives_no_papers() {
+        let (_scratch, index) = similar_library("similar-unindexed");
+
+        let similar = index.similar("fake:model", "d2020", 10).unwrap();
+        assert_eq!(similar.seed, "d2020");
+        assert!(similar.papers.is_empty());
+        assert_eq!(similar.unindexed, ["d2020"]);
+
+        let other_model = index.similar("other:model", "a2020", 10).unwrap();
+        assert!(other_model.papers.is_empty());
+        assert_eq!(other_model.unindexed, ["c2020", "a2020", "d2020", "b2020"]);
+    }
+
+    #[test]
+    fn similar_refuses_unknown_names() {
+        let (_scratch, index) = similar_library("similar-names");
+        assert!(matches!(
+            index.similar("fake:model", "nobody", 10),
+            Err(PaxError::NoSuchPaper(_))
+        ));
     }
 
     #[test]
