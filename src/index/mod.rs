@@ -4,4 +4,5 @@
 
 pub mod chunk;
 pub mod extract;
+pub mod similarity;
 pub mod store;
