@@ -2813,10 +2813,14 @@ mod tests {
         }
         let root = library_with_two_papers("export-pdfs-staged");
         without_hashes(&root);
+        // Cleared so a git hook's GIT_DIR can't point `git init` at this repo.
         let init = std::process::Command::new("git")
             .arg("init")
             .arg("-q")
             .arg(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         assert!(init.status.success());
