@@ -1,5 +1,5 @@
 {
-  description = "A Basic Rust DevShell";
+  description = "pax-ai: AI features and the pax-mcp MCP server for pax";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -41,14 +41,33 @@
         FROM ${nomicEmbedTextWeights}
         PARAMETER num_ctx 8192
       '';
+
+      # `nix run` and `lib.getExe` find the `pax-mcp` binary through
+      # mainProgram; the package is named after the crate (pax-ai).
+      pax-mcp =
+        (naerskLib.buildPackage {
+          src = ./.;
+          buildInputs = app_deps;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+        }).overrideAttrs
+          (old: {
+            meta = (old.meta or { }) // {
+              description = "MCP server exposing pax-core's library tools";
+              mainProgram = "pax-mcp";
+            };
+          });
     in
     {
 
-      packages."x86_64-linux".default = naerskLib.buildPackage {
-        src = ./.;
-        buildInputs = app_deps;
-        nativeBuildInputs = [ pkgs.pkg-config ];
+      # For a consumer that prefers `pkgs.pax-mcp` over `inputs.pax-ai.packages.<system>.pax-mcp`.
+      overlays.default = final: prev: {
+        pax-mcp = self.packages.${prev.stdenv.hostPlatform.system}.pax-mcp;
       };
+
+      homeModules.default = import ./home-manager-module.nix self;
+
+      packages."x86_64-linux".default = pax-mcp;
+      packages."x86_64-linux".pax-mcp = pax-mcp;
 
       # A consumer registers this with a local Ollama install via:
       #   ollama create nomic-embed-text -f <this>/Modelfile
