@@ -144,11 +144,11 @@ fn is_section_number(token: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn pdftotext_available() -> bool {
+    pub(crate) fn pdftotext_available() -> bool {
         Command::new(PDFTOTEXT)
             .arg("-v")
             .output()
@@ -156,7 +156,7 @@ mod tests {
     }
 
     /// A one-page PDF showing `lines`, with a correct xref table.
-    fn pdf_with_lines(lines: &[&str]) -> Vec<u8> {
+    pub(crate) fn pdf_with_lines(lines: &[&str]) -> Vec<u8> {
         let mut content = String::from("BT /F1 10 Tf 14 TL 72 760 Td\n");
         for line in lines {
             let escaped = line
