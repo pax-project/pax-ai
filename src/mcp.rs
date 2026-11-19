@@ -2,19 +2,26 @@
 //! so an agent calls pax directly instead of going through a shell and
 //! parsing CLI output.
 //!
-//! None of these tools need an LLM: they wrap `pax-core` calls, and every
+//! Most of these tools need no LLM: they wrap `pax-core` calls, and every
 //! write goes through `pax-core`, so an agent's decisions land in the same
 //! `research/` files the `pax` CLI and lazy-pax use — searches included,
 //! which are recorded in `research/search-log.jsonl`. Results are
 //! `pax-core`'s own output shapes (`pax_core::output`, and `Stats`), the
 //! ones the `pax` CLI prints with `--json`, so the two agree field for
-//! field; only `show`'s DOI lookup, which the CLI lacks, wraps one.
+//! field; only `show`'s DOI lookup, which the CLI lacks, wraps one. The
+//! exception is `index`, which builds pax-ai's own embedding index
+//! ([`PaperIndex`]) through an [`Embedder`] and returns its [`BuildReport`].
 
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::adapter::ollama::OllamaAdapter;
+use crate::blocking::blocking_with_timeout;
+use crate::index::{BuildReport, PaperIndex};
+use crate::port::Embedder;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
     ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, PaperList, PdfCopyState,
@@ -374,6 +381,8 @@ pub struct ShowOutput {
 pub struct PaxServer {
     root: PathBuf,
     config: Config,
+    /// What `index` embeds with: a local Ollama server's `nomic-embed-text`.
+    embedder: Arc<OllamaAdapter>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -383,6 +392,7 @@ impl PaxServer {
         PaxServer {
             root,
             config,
+            embedder: Arc::new(OllamaAdapter::new()),
             tool_router: Self::tool_router(),
         }
     }
@@ -917,9 +927,37 @@ impl PaxServer {
         .map_err(|e| e.to_string())?;
         Ok(Json(sync_results(&reports)))
     }
+
+    /// Build or update the library's embedding index (in
+    /// research/.pax-ai/, which git ignores), which semantic tools search:
+    /// every declared paper's title and venue, plus the full text of each
+    /// PDF fetched on this machine, embedded by a local Ollama server.
+    /// Incremental: what's already indexed is reused, so a rerun only
+    /// embeds new or changed papers, and entries for papers no longer in
+    /// the library are deleted. Reports one status per paper: `indexed`
+    /// with its chunk count, `fallback` with a reason when only the title
+    /// and venue are indexed (no PDF on this machine, or its text couldn't
+    /// be extracted or embedded; `fetch` provides a missing PDF, then
+    /// `index` again), or `failed` with a reason when nothing could be
+    /// embedded (e.g. Ollama isn't running). One paper's failure doesn't
+    /// stop the rest. Can take minutes on a large library.
+    #[tool]
+    async fn index(&self) -> Result<Json<BuildReport>, String> {
+        self.index_with(self.embedder.as_ref()).await
+    }
 }
 
 impl PaxServer {
+    /// `index` with `embedder`, so tests can index offline.
+    async fn index_with(&self, embedder: &impl Embedder) -> Result<Json<BuildReport>, String> {
+        self.papers_path()?;
+        PaperIndex::open(&self.root)
+            .build(embedder)
+            .await
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
     /// The library's `research/papers.nix`, or a clear error when the root
     /// has none.
     fn papers_path(&self) -> Result<PathBuf, String> {
@@ -990,7 +1028,9 @@ impl ServerHandler for PaxServer {
                  reproduce (check), list what's declared or excluded (list), export it as \
                  BibTeX text or back up the PDFs added from local files to a \
                  directory on this machine (export), and report PRISMA flow \
-                 counts (stats). \
+                 counts (stats). Build or update the library's embedding \
+                 index of titles, venues and fetched PDFs' full text \
+                 (index), through a local Ollama server. \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
                  ones): every tool that takes a citation key also takes an \
@@ -1141,21 +1181,6 @@ fn select_papers(
 /// (prefetch, then `git add` and build), so this only caps their sum.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Runs blocking work (a `nix` call) on tokio's blocking pool, so it never
-/// stalls the server's executor; `None` once `timeout` passes. The work
-/// itself can't be cancelled and runs on to its end in the background.
-async fn blocking_with_timeout<T: Send + 'static>(
-    timeout: Duration,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<Option<T>, String> {
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-        Ok(joined) => joined
-            .map(Some)
-            .map_err(|e| format!("the task failed: {e}")),
-        Err(_) => Ok(None),
-    }
-}
-
 /// `fetch`'s two pax-core steps: record the hash (downloading, unless one is
 /// recorded already, or adding `file`), then build the PDF to get its store
 /// path.
@@ -1300,6 +1325,9 @@ fn file_needed_reason() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::PaperStatus;
+    use crate::index::extract::tests::{pdf_with_lines, pdftotext_available};
+    use crate::index::tests::FakeEmbedder;
     use pax_core::output::SearchLogStatus;
     use pax_core::{CandidateWork, Exclusion, Exclusions, LogOutcome, ProviderError};
     use std::fs;
@@ -1381,6 +1409,7 @@ mod tests {
                 "exclude",
                 "export",
                 "fetch",
+                "index",
                 "list",
                 "refs",
                 "related",
@@ -3501,20 +3530,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_work_past_its_timeout_is_reported_as_none() {
-        let slow = blocking_with_timeout(Duration::from_millis(10), || {
-            std::thread::sleep(Duration::from_millis(500));
-        })
-        .await
-        .unwrap();
-        assert!(slow.is_none());
-        let quick = blocking_with_timeout(Duration::from_secs(5), || 42)
-            .await
-            .unwrap();
-        assert_eq!(quick, Some(42));
-    }
-
-    #[tokio::test]
     async fn show_takes_exactly_one_of_reference_or_doi() {
         let server = PaxServer::new(PathBuf::from("."), Config::default());
         let both_or_neither = [
@@ -3663,7 +3678,105 @@ mod tests {
                     assert!(properties.contains_key(field), "{field}");
                 }
             }
+            if tool.name == "index" {
+                let papers = &schema["properties"]["papers"];
+                assert_eq!(papers["type"], "array", "{schema:?}");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn index_without_a_library_is_a_clear_error() {
+        let server = PaxServer::new(PathBuf::from("/nonexistent/pax-mcp"), Config::default());
+        let Err(error) = server.index_with(&FakeEmbedder::new()).await else {
+            panic!("indexed without a library");
+        };
+        assert!(error.contains("no pax library"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn index_reports_papers_without_a_pdf_as_fallbacks_without_running_nix() {
+        let root = library_with_two_papers("index-fallback");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(report) = server.index_with(&FakeEmbedder::new()).await.unwrap();
+        let keys: Vec<&str> = report
+            .papers
+            .iter()
+            .map(|p| p.citation_key.as_str())
+            .collect();
+        assert_eq!(keys, ["turing1936", "hewitt1973"]);
+        for paper in &report.papers {
+            assert!(
+                matches!(&paper.status, PaperStatus::Fallback { reason } if reason.contains("no PDF source")),
+                "{paper:?}"
+            );
+        }
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["papers"][0]["status"], "fallback");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_embeds_a_fetched_pdfs_full_text_and_falls_back_when_it_cant() {
+        if !nix_available() || !pdftotext_available() {
+            eprintln!("skipped: nix or pdftotext isn't available");
+            return;
+        }
+        let mut scratch = StoreScratch::new(library_with_two_papers("index-full-text"));
+        let root = scratch.root.clone();
+        let server = PaxServer::new(root.clone(), Config::default());
+        let pdf = pdf_with_lines(&[
+            "Introduction",
+            "Indexing full texts lets an agent find passages by meaning.",
+            "This line is unique to the pax-ai index test.",
+        ]);
+        let pdf = String::from_utf8(pdf).unwrap();
+        add_local_pdf(&server, &mut scratch, "hewitt1973", &pdf).await;
+        let status = |report: &BuildReport, key: &str| {
+            report
+                .papers
+                .iter()
+                .find(|p| p.citation_key == key)
+                .unwrap_or_else(|| panic!("{key} in {report:?}"))
+                .status
+                .clone()
+        };
+
+        let Json(report) = server.index_with(&FakeEmbedder::new()).await.unwrap();
+        assert!(
+            matches!(status(&report, "hewitt1973"), PaperStatus::Indexed { chunks } if chunks >= 1),
+            "{report:?}"
+        );
+        // turing1936's recorded hash isn't even a valid one, so nix can't
+        // resolve its PDF: a fallback, not a failed run.
+        assert!(
+            matches!(status(&report, "turing1936"), PaperStatus::Fallback { reason } if reason.contains("couldn't be resolved")),
+            "{report:?}"
+        );
+        let vectors = PaperIndex::open(&root)
+            .vectors("fake:model", "hewitt1973")
+            .unwrap();
+        assert!(!vectors.fallback);
+        assert!(
+            vectors.chunks[1..]
+                .iter()
+                .any(|c| c.text.contains("unique"))
+        );
+
+        // Without the stored entries, a failure embedding the chunks leaves
+        // the title + venue vector: a fallback, not a failure.
+        fs::remove_dir_all(root.join("research/.pax-ai")).unwrap();
+        let Json(report) = server
+            .index_with(&FakeEmbedder::failing_on("unique"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(status(&report, "hewitt1973"), PaperStatus::Fallback { reason } if reason.contains("embedding the full text failed")),
+            "{report:?}"
+        );
     }
 
     fn alias(reference: &str, alias: &str) -> Parameters<EditParams> {

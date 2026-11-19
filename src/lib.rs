@@ -7,6 +7,7 @@
 //! architecture rationale.
 
 pub mod adapter;
+mod blocking;
 pub mod error;
 pub mod index;
 #[cfg(feature = "mcp")]
