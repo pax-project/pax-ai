@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Git exports GIT_DIR (and GIT_INDEX_FILE in pre-commit) to hooks. Tests that
+# run git, directly or through pax-core (git init, git add -A, git
+# check-ignore), would inherit them and act on this repo instead of their
+# temp fixtures: a fixture's `git init` once marked this checkout bare.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
+
 # Facade: the fast subset of the quality gate. All logic lives behind
 # `just` (see justfile) so this hook, `pre-push`, and CI stay in sync.
 exec nix develop --command just pre-commit
