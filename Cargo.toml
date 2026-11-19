@@ -16,8 +16,16 @@ required-features = ["mcp"]
 [features]
 default = ["mcp"]
 # The MCP server (`pax_ai::mcp` + the `pax-mcp` binary). Off for library
-# consumers like lazy-pax, so they don't pull in the MCP SDK or tokio.
-mcp = ["dep:rmcp", "dep:schemars", "dep:tokio", "pax-core/schemars"]
+# consumers like lazy-pax, so they don't pull in the MCP SDK or tokio's
+# multi-threaded runtime.
+mcp = [
+    "dep:rmcp",
+    "dep:schemars",
+    "pax-core/schemars",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+    "tokio/io-std",
+]
 
 [dependencies]
 pax-core = { package = "pax-core-papers", version = "3.3.1", default-features = false }
@@ -28,7 +36,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.20"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "time"], optional = true }
+# The index runs `nix` and `pdftotext` on tokio's blocking pool, with a
+# timeout. reqwest already depends on tokio, so this adds no crate.
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -15,6 +15,7 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::blocking::blocking_with_timeout;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
     ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, PaperList, PdfCopyState,
@@ -1140,21 +1141,6 @@ fn select_papers(
 /// How long `fetch` waits. pax-core already bounds each `nix` call it makes
 /// (prefetch, then `git add` and build), so this only caps their sum.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Runs blocking work (a `nix` call) on tokio's blocking pool, so it never
-/// stalls the server's executor; `None` once `timeout` passes. The work
-/// itself can't be cancelled and runs on to its end in the background.
-async fn blocking_with_timeout<T: Send + 'static>(
-    timeout: Duration,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<Option<T>, String> {
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-        Ok(joined) => joined
-            .map(Some)
-            .map_err(|e| format!("the task failed: {e}")),
-        Err(_) => Ok(None),
-    }
-}
 
 /// `fetch`'s two pax-core steps: record the hash (downloading, unless one is
 /// recorded already, or adding `file`), then build the PDF to get its store
@@ -3498,20 +3484,6 @@ mod tests {
             "{reason}"
         );
         assert_eq!(fs::read_to_string(&papers).unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn blocking_work_past_its_timeout_is_reported_as_none() {
-        let slow = blocking_with_timeout(Duration::from_millis(10), || {
-            std::thread::sleep(Duration::from_millis(500));
-        })
-        .await
-        .unwrap();
-        assert!(slow.is_none());
-        let quick = blocking_with_timeout(Duration::from_secs(5), || 42)
-            .await
-            .unwrap();
-        assert_eq!(quick, Some(42));
     }
 
     #[tokio::test]
