@@ -12,7 +12,9 @@
 //! exception is `index`, which builds pax-ai's own embedding index
 //! ([`PaperIndex`]) through an [`Embedder`] and returns its [`BuildReport`].
 //! `semantic_search` ranks over that index and returns its
-//! [`SemanticResults`].
+//! [`SemanticResults`]. `rank_candidates` scores provider candidates
+//! against one indexed library paper, and returns pax-core's
+//! [`MergedHit`]s with their scores.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -22,18 +24,20 @@ use std::time::Duration;
 
 use crate::adapter::ollama::OllamaAdapter;
 use crate::blocking::blocking_with_timeout;
-use crate::index::{BuildReport, PaperIndex, SemanticResults, Similar};
+use crate::index::candidates::{CandidateScore, best_first, score_candidates};
+use crate::index::{BuildReport, PaperIndex, PaperVectors, SemanticResults, Similar};
 use crate::port::Embedder;
+use pax_core::merge::MERGE_ORDER;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
-    ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, PaperList, PdfCopyState,
-    SearchResults, Shown, SyncResults,
+    ExclusionList, Exported, ExportedPdfs, FetchResult, FetchState, Lists, MergedHit, PaperList,
+    PdfCopyState, SearchResults, Shown, SyncResults,
 };
 use pax_core::{
-    CandidateId, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage, FetchOutcome,
-    Filters, Library, LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper, PaperEdits,
-    PaxError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage, SeedResults, Stats,
-    SyncReport, YearRange,
+    CandidateId, CandidateWork, Config, DocType, ExclusionFilter, ExclusionOptions, ExclusionStage,
+    FetchOutcome, Filters, Library, LibraryIndex, Limit, ListFilter, Logged, NameHolder, Paper,
+    PaperEdits, PaxError, ProviderError, ProviderId, ResolvedArtifact, SearchOptions, SearchPage,
+    SeedResults, Stats, SyncReport, YearRange,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -396,6 +400,95 @@ pub struct SimilarParams {
 
 /// How many papers `similar` returns without a `limit`.
 const SIMILAR_LIMIT: usize = 10;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct RankCandidatesParams {
+    /// The library paper to rank against: a citation key or alias, e.g.
+    /// `P17`. It must be in the embedding index (`index` adds it).
+    pub seed: String,
+    /// Candidates as `search`, `refs`, `cited_by` and `related` return
+    /// them: provider references, e.g. `openalex:W2072794470`. Give at least
+    /// one of `references` or `dois`.
+    #[serde(default)]
+    pub references: Vec<String>,
+    /// Candidates by DOI (bare or `https://doi.org/...`).
+    #[serde(default)]
+    pub dois: Vec<String>,
+}
+
+/// The most candidates `rank_candidates` looks up in one call.
+const RANK_LIMIT: usize = 100;
+
+/// How many candidate lookups `rank_candidates` runs at once.
+const LOOKUP_CONCURRENCY: usize = 4;
+
+/// What every ranking says about its scores.
+const RANKING_NOTE: &str = "scores rank candidates against this seed only; not comparable \
+                            with `similar`";
+
+/// One candidate `rank_candidates` ranked: pax-core's [`MergedHit`], as
+/// `search` returns a paper, plus its score against the seed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RankedCandidate {
+    #[serde(flatten)]
+    pub hit: MergedHit,
+    /// The candidate's best cosine among the seed's indexed vectors; higher
+    /// is closer, at most 1.
+    pub score: f32,
+    /// Whether the candidate's abstract was embedded with its title; without
+    /// one, only the title was, and the score says less.
+    pub had_abstract: bool,
+}
+
+/// A candidate `rank_candidates` couldn't look up.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FailedLookup {
+    /// The reference or DOI, as given (a DOI normalized).
+    pub reference: String,
+    pub reason: String,
+}
+
+/// What `rank_candidates` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RankedCandidates {
+    /// The seed's citation key.
+    pub seed: String,
+    /// Only the seed's title and venue are indexed (no full text), so the
+    /// scores say less.
+    pub seed_fallback: bool,
+    /// Best first.
+    pub ranked: Vec<RankedCandidate>,
+    /// Lookups that failed; the other candidates are still ranked.
+    pub failed: Vec<FailedLookup>,
+    pub note: String,
+}
+
+/// One candidate `rank_candidates` looks up.
+#[derive(Debug, Clone)]
+enum Lookup {
+    Reference(String, CandidateId),
+    Doi(String),
+}
+
+impl Lookup {
+    /// The candidate as given, for `failed`.
+    fn reference(&self) -> &str {
+        match self {
+            Lookup::Reference(reference, _) | Lookup::Doi(reference) => reference,
+        }
+    }
+
+    /// The provider record: a reference resolved directly, a DOI looked up
+    /// at every provider that resolves DOIs (unlogged, as `show` does).
+    async fn run(self, config: Config) -> Result<CandidateWork, String> {
+        match self {
+            Lookup::Reference(_, id) => pax_core::resolve_candidate(&id, &config)
+                .await
+                .map_err(|e| e.to_string()),
+            Lookup::Doi(doi) => doi_record(&pax_core::search_by_doi(&doi, &config).await),
+        }
+    }
+}
 
 /// Serves one research library: `root` is the directory containing
 /// `research/`, as for the `pax` CLI.
@@ -1006,6 +1099,204 @@ impl PaxServer {
     ) -> Result<Json<Similar>, String> {
         self.similar_with(self.embedder.model_id(), params)
     }
+
+    /// Rank papers that aren't in the library, such as `search`, `refs`,
+    /// `cited_by` or `related` results, by how close in content each is to
+    /// one library paper (`seed`, which must be in the embedding index:
+    /// run `index` first). Give the candidates as provider `references`
+    /// and/or `dois`, at most 100. Each is looked up again (not recorded in
+    /// the search log: the search that found it already was), and embedded
+    /// by the local Ollama server from its title and abstract, or its title
+    /// alone (`had_abstract: false`, a less reliable score). Returns the
+    /// candidates best first, as `search` lists papers plus a `score`
+    /// (higher is closer, at most 1), and the lookups that `failed`. Scores
+    /// only rank these candidates against this seed: they aren't comparable
+    /// with `similar`'s. To rank one page of results in the same call, give
+    /// `search`, `refs`, `cited_by` or `related` a `rank_by` instead.
+    #[tool]
+    async fn rank_candidates(
+        &self,
+        Parameters(params): Parameters<RankCandidatesParams>,
+    ) -> Result<Json<RankedCandidates>, String> {
+        self.rank_candidates_with(self.embedder.as_ref(), params)
+            .await
+    }
+}
+
+impl PaxServer {
+    /// `rank_candidates` with `embedder`, so tests can refuse requests
+    /// offline. Arguments and the seed are checked before any lookup.
+    async fn rank_candidates_with(
+        &self,
+        embedder: &impl Embedder,
+        params: RankCandidatesParams,
+    ) -> Result<Json<RankedCandidates>, String> {
+        let lookups = candidate_lookups(&params.references, &params.dois)?;
+        let seed = self.ranking_seed(embedder.model_id(), "seed", &params.seed)?;
+        let found = look_up(&self.config, lookups).await;
+        self.rank_found(embedder, seed, found).await.map(Json)
+    }
+
+    /// The indexed vectors of the seed `param` names, refused when it isn't
+    /// indexed for `model_id`, before anything is searched or looked up.
+    fn ranking_seed(
+        &self,
+        model_id: &str,
+        param: &str,
+        name: &str,
+    ) -> Result<PaperVectors, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!(
+                "`{param}` must be a citation key or alias, e.g. `turing1936`"
+            ));
+        }
+        self.papers_path()?;
+        let seed = PaperIndex::open(&self.root)
+            .vectors(model_id, name)
+            .map_err(name_error)?;
+        if seed.chunks.is_empty() {
+            return Err(format!(
+                "{name} isn't in the embedding index yet, so nothing can be ranked against it; \
+                 run `index` first"
+            ));
+        }
+        Ok(seed)
+    }
+
+    /// The looked-up candidates scored against `seed`, best first, flagged
+    /// against the library; the failed lookups apart.
+    async fn rank_found(
+        &self,
+        embedder: &impl Embedder,
+        seed: PaperVectors,
+        found: Vec<(String, Result<CandidateWork, String>)>,
+    ) -> Result<RankedCandidates, String> {
+        let mut works = Vec::new();
+        let mut failed = Vec::new();
+        for (reference, result) in found {
+            match result {
+                Ok(work) => works.push(work),
+                Err(reason) => failed.push(FailedLookup { reference, reason }),
+            }
+        }
+        let scores = score_candidates(embedder, &seed, &works)
+            .await
+            .map_err(|e| format!("embedding the candidates failed: {e}"))?;
+        let index = LibraryIndex::load(&self.root);
+        let ranked = best_first(&scores)
+            .into_iter()
+            .flat_map(|i| {
+                let CandidateScore {
+                    score,
+                    had_abstract,
+                } = scores[i];
+                pax_core::merge_works([works[i].clone()])
+                    .works
+                    .iter()
+                    .map(|merged| RankedCandidate {
+                        hit: MergedHit::new(merged, &index, &|_| false, false),
+                        score,
+                        had_abstract,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(RankedCandidates {
+            seed: seed.citation_key,
+            seed_fallback: seed.fallback,
+            ranked,
+            failed,
+            note: RANKING_NOTE.to_string(),
+        })
+    }
+}
+
+/// The lookups `rank_candidates` asks for: every reference a provider
+/// reference, every DOI a DOI, and between 1 and [`RANK_LIMIT`] in all.
+fn candidate_lookups(references: &[String], dois: &[String]) -> Result<Vec<Lookup>, String> {
+    let count = references.len() + dois.len();
+    if count == 0 {
+        return Err("give at least one of `references` or `dois` to rank".to_string());
+    }
+    if count > RANK_LIMIT {
+        return Err(format!(
+            "{count} candidates is more than {RANK_LIMIT} per call; rank them in several calls"
+        ));
+    }
+    let mut lookups = Vec::with_capacity(count);
+    for reference in references {
+        let reference = reference.trim();
+        let id: CandidateId = reference
+            .parse()
+            .map_err(|e| format!("{reference:?} in `references`: {e}"))?;
+        lookups.push(Lookup::Reference(reference.to_string(), id));
+    }
+    for doi in dois {
+        lookups.push(Lookup::Doi(doi_param(doi)?));
+    }
+    Ok(lookups)
+}
+
+/// Every lookup's result, in the order given, [`LOOKUP_CONCURRENCY`] at a
+/// time on tokio's runtime, so no provider call blocks the event thread.
+async fn look_up(
+    config: &Config,
+    lookups: Vec<Lookup>,
+) -> Vec<(String, Result<CandidateWork, String>)> {
+    let mut found = Vec::with_capacity(lookups.len());
+    for batch in lookups.chunks(LOOKUP_CONCURRENCY) {
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|lookup| tokio::spawn(lookup.clone().run(config.clone())))
+            .collect();
+        for (lookup, handle) in batch.iter().zip(handles) {
+            let result = handle
+                .await
+                .unwrap_or_else(|e| Err(format!("the lookup didn't finish: {e}")));
+            found.push((lookup.reference().to_string(), result));
+        }
+    }
+    found
+}
+
+/// The provider record of a DOI to rank: the first, in pax-core's merge
+/// order, that has an abstract, else the first found; or why none was.
+fn doi_record(
+    results: &HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>>,
+) -> Result<CandidateWork, String> {
+    let records: Vec<&CandidateWork> = MERGE_ORDER
+        .iter()
+        .filter_map(|provider| results.get(provider)?.as_ref().ok())
+        .flatten()
+        .collect();
+    let has_abstract = |work: &CandidateWork| {
+        work.abstract_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let chosen = records
+        .iter()
+        .find(|work| has_abstract(work))
+        .or(records.first());
+    if let Some(work) = chosen {
+        return Ok((*work).clone());
+    }
+    let errors: Vec<String> = MERGE_ORDER
+        .iter()
+        .filter_map(|provider| match results.get(provider)? {
+            Err(ProviderError::NotFound) | Ok(_) => None,
+            Err(e) => Some(format!("{provider}: {e}")),
+        })
+        .collect();
+    Err(if errors.is_empty() {
+        "no provider has a record of this DOI".to_string()
+    } else {
+        format!(
+            "no provider returned a record of this DOI ({})",
+            errors.join("; ")
+        )
+    })
 }
 
 impl PaxServer {
@@ -1140,6 +1431,9 @@ impl ServerHandler for PaxServer {
                  (similar). \
                  Search the declared papers by meaning over that index, \
                  each with its best-matching passage (semantic_search). \
+                 Rank papers that aren't in the library, such as search \
+                 results, by how close in content each is to an indexed \
+                 library paper (rank_candidates). \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
                  ones): every tool that takes a citation key also takes an \
@@ -1521,6 +1815,7 @@ mod tests {
                 "fetch",
                 "index",
                 "list",
+                "rank_candidates",
                 "refs",
                 "related",
                 "search",
@@ -3805,6 +4100,12 @@ mod tests {
                     assert_eq!(schema["properties"][field]["type"], "array", "{schema:?}");
                 }
             }
+            if tool.name == "rank_candidates" {
+                let properties = schema["properties"].as_object().unwrap();
+                for field in ["seed", "seed_fallback", "ranked", "failed", "note"] {
+                    assert!(properties.contains_key(field), "{field}");
+                }
+            }
         }
     }
 
@@ -4034,6 +4335,185 @@ mod tests {
         assert_eq!(json["hits"][0]["citation_key"], "hewitt1973");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // Ranking provider candidates against a library paper (#65).
+
+    /// A library whose two papers are indexed by [`FakeEmbedder`] (as
+    /// fallbacks: neither has a PDF), with `hewitt1973` aliased `P17`.
+    async fn indexed_library(name: &str) -> (PathBuf, PaxServer) {
+        let root = library_with_two_papers(name);
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        server
+            .edit(alias("hewitt1973", "P17"))
+            .await
+            .expect("alias set");
+        server.index_with(&FakeEmbedder::new()).await.unwrap();
+        (root, server)
+    }
+
+    fn ranking(seed: &str, references: &[&str], dois: &[&str]) -> RankCandidatesParams {
+        RankCandidatesParams {
+            seed: seed.to_string(),
+            references: references.iter().map(|r| r.to_string()).collect(),
+            dois: dois.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_candidates_refuses_bad_arguments_and_an_unindexed_seed_before_any_lookup() {
+        let root = library_with_two_papers("rank-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let embedder = FakeEmbedder::new();
+        let too_many: Vec<String> = (0..=RANK_LIMIT).map(|n| format!("openalex:W{n}")).collect();
+        let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+
+        for (params, expected) in [
+            (ranking("hewitt1973", &[], &[]), "at least one"),
+            (ranking("hewitt1973", &too_many, &[]), "more than 100"),
+            (ranking("hewitt1973", &["W123"], &[]), "`references`"),
+            (ranking("hewitt1973", &[], &["openalex:W1"]), "not a DOI"),
+            (ranking("  ", &["openalex:W1"], &[]), "`seed`"),
+            (ranking("nobody", &["openalex:W1"], &[]), "nobody"),
+            // Valid candidates, but the library isn't indexed: refused
+            // before any provider is asked.
+            (
+                ranking("turing1936", &["openalex:W1"], &["10.1/x"]),
+                "run `index` first",
+            ),
+            (ranking("hewitt1973", &["openalex:W1"], &[]), "`index`"),
+        ] {
+            let Err(error) = server.rank_candidates_with(&embedder, params).await else {
+                panic!("ranked with {expected}");
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(embedder.kinds.lock().unwrap().is_empty());
+
+        let server = PaxServer::new(PathBuf::from("/nonexistent/pax-mcp"), Config::default());
+        let Err(error) = server
+            .rank_candidates_with(&embedder, ranking("hewitt1973", &["openalex:W1"], &[]))
+            .await
+        else {
+            panic!("ranked without a library");
+        };
+        assert!(error.contains("no pax library"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn found_candidates_rank_best_first_flagged_against_the_library() {
+        let (root, server) = indexed_library("rank-found").await;
+        let seed = server.ranking_seed("fake:model", "seed", "P17").unwrap();
+        let mut with_abstract = work(ProviderId::Crossref, "10.1/b", "Actors", Some("10.1/b"));
+        with_abstract.abstract_text = Some("Message passing between actors.".to_string());
+        let found = vec![
+            (
+                "openalex:W1".to_string(),
+                Ok(work(
+                    ProviderId::OpenAlex,
+                    "W1",
+                    "On Computable Numbers",
+                    Some("10.1112/plms/s2-42.1.230"),
+                )),
+            ),
+            ("10.1/b".to_string(), Ok(with_abstract)),
+            (
+                "openalex:W3".to_string(),
+                Ok(work(
+                    ProviderId::OpenAlex,
+                    "W3",
+                    "A Universal Modular Actor Formalism",
+                    None,
+                )),
+            ),
+            ("openalex:W4".to_string(), Err("not found".to_string())),
+        ];
+        let embedder = FakeEmbedder::new();
+
+        let out = server.rank_found(&embedder, seed, found).await.unwrap();
+
+        assert_eq!(*embedder.kinds.lock().unwrap(), [EmbedKind::Document]);
+        assert_eq!(embedder.embedded(), 3, "the failed lookup isn't embedded");
+        assert_eq!((out.seed.as_str(), out.seed_fallback), ("hewitt1973", true));
+        assert_eq!(out.ranked[0].hit.work.id, "openalex:W3");
+        assert!((out.ranked[0].score - 1.0).abs() < 1e-5, "{out:?}");
+        assert!(out.ranked.windows(2).all(|w| w[0].score >= w[1].score));
+        let turing = out
+            .ranked
+            .iter()
+            .find(|r| r.hit.work.id == "openalex:W1")
+            .unwrap();
+        assert!(turing.hit.work.in_library && !turing.had_abstract);
+        let actors = out
+            .ranked
+            .iter()
+            .find(|r| r.hit.work.id == "crossref:10.1/b")
+            .unwrap();
+        assert!(actors.had_abstract && !actors.hit.work.in_library);
+        let [failed] = &out.failed[..] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            (failed.reference.as_str(), failed.reason.as_str()),
+            ("openalex:W4", "not found")
+        );
+
+        let json = serde_json::to_value(&out).unwrap();
+        let first = &json["ranked"][0];
+        assert_eq!(first["id"], "openalex:W3");
+        assert_eq!(first["providers"], serde_json::json!(["openalex"]));
+        assert_eq!(first["had_abstract"], false);
+        assert!(first["score"].is_number());
+        assert!(first.get("abstract").is_none(), "{first}");
+        assert!(json["note"].as_str().unwrap().contains("not comparable"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_doi_ranks_the_record_with_an_abstract_or_says_why_there_is_none() {
+        let doi = "10.1/a";
+        let bare = work(ProviderId::OpenAlex, "W1", "A", Some(doi));
+        let mut described = work(ProviderId::SemanticScholar, "S1", "A", Some(doi));
+        described.abstract_text = Some("An abstract.".to_string());
+        let results = HashMap::from([
+            (ProviderId::OpenAlex, Ok(vec![bare.clone()])),
+            (ProviderId::Crossref, Err(ProviderError::NotFound)),
+            (ProviderId::SemanticScholar, Ok(vec![described.clone()])),
+        ]);
+        assert_eq!(doi_record(&results), Ok(described));
+
+        let results = HashMap::from([
+            (ProviderId::OpenAlex, Ok(vec![bare.clone()])),
+            (ProviderId::Crossref, Err(ProviderError::NotFound)),
+        ]);
+        assert_eq!(doi_record(&results), Ok(bare));
+
+        let results: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([
+                (ProviderId::OpenAlex, Err(ProviderError::NotFound)),
+                (ProviderId::Crossref, Err(ProviderError::NotFound)),
+            ]);
+        assert_eq!(
+            doi_record(&results),
+            Err("no provider has a record of this DOI".to_string())
+        );
+
+        let results: HashMap<ProviderId, Result<Vec<CandidateWork>, ProviderError>> =
+            HashMap::from([(
+                ProviderId::OpenAlex,
+                Err(ProviderError::Request("timed out".to_string())),
+            )]);
+        let Err(reason) = doi_record(&results) else {
+            panic!("found a record");
+        };
+        assert!(
+            reason.contains("openalex") && reason.contains("timed out"),
+            "{reason}"
+        );
     }
 
     fn alias(reference: &str, alias: &str) -> Parameters<EditParams> {
