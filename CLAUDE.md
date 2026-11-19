@@ -22,6 +22,7 @@ The LLM/embedding capability is a port (trait), not a hardcoded client — cost,
 - **Port:** a trait covering the operations `pax-ai` actually needs (e.g. summarize, embed) — shaped by real call sites, not spec'd upfront.
 - **First adapter:** Anthropic (hosted). Sends abstracts/paper text to a third-party API — this is an explicit, deliberate choice, not a default; a local-model adapter (e.g. via Ollama) is the expected second adapter once the port's shape has settled against a real client.
 - Adapter choice is a runtime/config concern, not a compile-time feature flag split, so a deployment can switch backends without a rebuild.
+- `Embedder` (`src/port.rs`) has a `model_id` (part of every embedding-store key, e.g. `ollama:nomic-embed-text`) and a batch `embed(texts, EmbedKind)` whose future is `Send`; it returns one vector per input, in order, unnormalized, and a count mismatch is `PortError::UnexpectedResponse`. `EmbedKind` says whether text is a document or a query: the adapter adds any model-specific prefix (`OllamaAdapter` adds `search_document: `/`search_query: ` for `nomic-embed-text`), so callers never do.
 
 None of this is implemented yet — this repo is currently a bootstrap scaffold (`Cargo.toml`, `flake.nix`/`.envrc`, empty `src/lib.rs`). Update this section as the port/adapter split actually lands in code.
 
