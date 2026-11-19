@@ -14,5 +14,5 @@ pub mod port;
 pub mod summary;
 
 pub use error::PortError;
-pub use port::{Embedder, Summarizer};
+pub use port::{EmbedKind, Embedder, Summarizer};
 pub use summary::SummaryCache;
