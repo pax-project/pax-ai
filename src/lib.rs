@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod error;
+pub mod index;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod port;
