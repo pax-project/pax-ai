@@ -1,4 +1,8 @@
-//! The embedding-based paper index: per-paper chunk vectors shared by
-//! related-paper recommendations, semantic search and RAG retrieval.
+//! The embedding index shared by related-paper recommendations, full-text
+//! semantic search and RAG retrieval: each paper's full text, extracted from
+//! its PDF and chunked, plus a title + venue vector (see #52).
 
+pub mod chunk;
+pub mod extract;
 pub mod similarity;
+pub mod store;

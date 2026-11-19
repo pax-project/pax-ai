@@ -13,13 +13,31 @@ pub trait Summarizer {
     async fn summarize(&self, text: &str) -> Result<String, PortError>;
 }
 
-/// Embeds text into a dense vector for similarity search — related-paper
+/// Whether text is embedded as a document to be searched or as a query to
+/// search with. Some models (e.g. `nomic-embed-text`) embed the two
+/// differently; the adapter handles that, so callers only say which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedKind {
+    Document,
+    Query,
+}
+
+/// Embeds text into dense vectors for similarity search — related-paper
 /// recommendations, full-text semantic search, and RAG retrieval all reduce
 /// to nearest-neighbor lookups over vectors this produces.
 ///
 /// See [`Summarizer`] for why this is a separate trait rather than folded
 /// into one.
-#[allow(async_fn_in_trait)]
 pub trait Embedder {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError>;
+    /// Stable id of the backend + model, e.g. "ollama:nomic-embed-text". Part of every store key.
+    fn model_id(&self) -> &str;
+    /// One vector per input, in order; a count mismatch is `PortError::UnexpectedResponse`.
+    /// The future is `Send`, so MCP tool handlers can await it.
+    ///
+    /// Vectors come back as the backend returns them, not normalized.
+    fn embed(
+        &self,
+        texts: &[&str],
+        kind: EmbedKind,
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, PortError>> + Send;
 }
