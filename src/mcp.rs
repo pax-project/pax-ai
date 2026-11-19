@@ -199,7 +199,12 @@ pub struct SyncParams {
     /// A backup directory `export` wrote with `format: "pdfs"` (or any
     /// holding `<citation_key>.pdf` files) to restore PDFs added from local
     /// files from: an absolute path, or one relative to the library root.
+    /// Not with `from_backup`.
     pub from: Option<String>,
+    /// Restore from the default backup directory, `research/.pdfs/`, which
+    /// `export` with `format: "pdfs"` and no `dir` writes. Not with `from`.
+    #[serde(default)]
+    pub from_backup: bool,
 }
 
 /// When in screening a paper was excluded; PRISMA reports the two apart.
@@ -327,20 +332,27 @@ pub struct ExportParams {
     /// `bibtex` only.
     pub tag: Option<String>,
     /// The backup directory, created if needed: an absolute path, or one
-    /// relative to the library root. `pdfs` only, and required with it.
+    /// relative to the library root. `pdfs` only; without it, the default
+    /// `research/.pdfs/`, which git ignores.
     pub dir: Option<String>,
 }
 
 /// What `export` returns: pax-core's [`Exported`] (`citation_keys`,
 /// `bibtex`) for `bibtex`, or its [`ExportedPdfs`] (`directory`,
 /// `manifest`, `papers`, and counts) for `pdfs`, the shapes `pax export
-/// bibtex --json` and `pax export pdfs --json` print.
+/// bibtex --json` and `pax export pdfs --json` print. `warnings` is this
+/// server's own addition: what the CLI prints on stderr, such as a `pdfs`
+/// backup directory git would commit with the library.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ExportOutput {
     #[serde(flatten)]
     pub text: Option<Exported>,
     #[serde(flatten)]
     pub pdfs: Option<ExportedPdfs>,
+    /// What the agent should tell the user about this export; absent when
+    /// there's nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What `show` found. For a `reference`, pax-core's [`Shown`]: exactly one of
@@ -684,13 +696,18 @@ impl PaxServer {
     /// and can't be downloaded again: each is copied to
     /// `<dir>/<citation_key>.pdf`, and `<dir>/manifest.json` maps each
     /// exported citation key to its hash. Papers with a source URL aren't
-    /// included, since Nix downloads them again. Nothing is uploaded: the
-    /// PDFs stay in `dir` on this machine unless the user copies the
-    /// directory elsewhere, so choose one outside `research/`, which pax
-    /// stages in git. `sync` with `from` set to the directory restores the
-    /// backup, here or on another machine with the same library. A paper
-    /// whose file isn't in this Nix store is reported as `missing` and the
-    /// rest are still exported.
+    /// included, since Nix downloads them again. Without `dir`, the backup
+    /// goes to `research/.pdfs/`, which git ignores, so the PDFs (often
+    /// paywalled) are never committed with the library. Nothing is uploaded:
+    /// that folder is on the same disk as the Nix store, so a real backup
+    /// needs the user to copy it off this machine. A `dir` inside
+    /// `research/` that git doesn't ignore is still written, but would be
+    /// committed with the library, and the result's `warnings` says so:
+    /// pass that on to the user. `sync` with `from_backup` (the default
+    /// folder) or `from` (the directory) restores the backup, here or on
+    /// another machine with the same library. A paper whose file isn't in
+    /// this Nix store is reported as `missing` and the rest are still
+    /// exported.
     #[tool]
     async fn export(
         &self,
@@ -706,16 +723,29 @@ impl PaxServer {
                 );
             }
             let dir = match params.dir.as_deref().map(str::trim) {
-                Some(dir) if !dir.is_empty() => self.root.join(dir),
-                _ => return Err("`pdfs` needs `dir`, the backup directory".to_string()),
+                Some("") => {
+                    return Err(
+                        "`dir` is blank: give the backup directory, or leave it out for \
+                         the default research/.pdfs/"
+                            .to_string(),
+                    );
+                }
+                Some(dir) => self.root.join(dir),
+                None => pax_core::default_backup_dir(&self.root),
             };
             let root = self.root.clone();
-            let mut exported = tokio::task::spawn_blocking(move || {
-                pax_core::export_pdfs(&root, &dir).map(|export| ExportedPdfs::new(&export))
+            let (mut exported, staged_by_git) = tokio::task::spawn_blocking(move || {
+                pax_core::export_pdfs(&root, &dir)
+                    .map(|export| (ExportedPdfs::new(&export), export.staged_by_git))
             })
             .await
             .map_err(|e| format!("export didn't finish: {e}"))?
             .map_err(|e| e.to_string())?;
+            let warnings = if staged_by_git {
+                vec![staged_by_git_warning(&exported.directory)]
+            } else {
+                Vec::new()
+            };
             // pax-core's error names the CLI's commands.
             for paper in &mut exported.papers {
                 if paper.status == PdfCopyState::Missing {
@@ -725,6 +755,7 @@ impl PaxServer {
             return Ok(Json(ExportOutput {
                 text: None,
                 pdfs: Some(exported),
+                warnings,
             }));
         }
         if params.dir.is_some() {
@@ -741,6 +772,7 @@ impl PaxServer {
         Ok(Json(ExportOutput {
             text: Some(Exported::new(&papers)),
             pdfs: None,
+            warnings: Vec::new(),
         }))
     }
 
@@ -829,24 +861,51 @@ impl PaxServer {
     /// one paper's failure doesn't stop the rest. Needs the network and can
     /// take a long time on a large library.
     ///
-    /// With `from`, first restore the PDFs added from local files from a
-    /// backup directory on this machine, as `export` with `format: "pdfs"`
-    /// writes one (`<citation_key>.pdf` files plus a manifest): each such
+    /// With `from` (a directory) or `from_backup: true` (the default
+    /// `research/.pdfs/`), first restore the PDFs added from local files
+    /// from a backup directory on this machine, as `export` with
+    /// `format: "pdfs"` writes one (`<citation_key>.pdf` files plus a
+    /// manifest): each such
     /// paper whose file is there is added back to the Nix store when the
     /// file's hash is the one recorded in `papers.nix`, and reported as a
     /// `hash-mismatch` and skipped when it isn't; a recorded hash is never
     /// replaced. Every other paper is fetched as without `from`. A `from`
-    /// that isn't a directory is an error.
+    /// that isn't a directory, or `from_backup` with no backup in
+    /// `research/.pdfs/`, is an error.
     #[tool]
     async fn sync(
         &self,
         Parameters(params): Parameters<SyncParams>,
     ) -> Result<Json<SyncResults>, String> {
         self.papers_path()?;
-        let from = match params.from.as_deref().map(str::trim) {
-            Some("") => return Err("`from` is blank: give the backup directory".to_string()),
-            Some(dir) => Some(self.root.join(dir)),
-            None => None,
+        let from = match (params.from.as_deref().map(str::trim), params.from_backup) {
+            (Some(_), true) => {
+                return Err(
+                    "give `from` (a backup directory) or `from_backup` (the default \
+                     research/.pdfs/), not both"
+                        .to_string(),
+                );
+            }
+            (Some(""), false) => {
+                return Err(
+                    "`from` is blank: give the backup directory, or `from_backup: true` \
+                     for the default research/.pdfs/"
+                        .to_string(),
+                );
+            }
+            (Some(dir), false) => Some(self.root.join(dir)),
+            (None, true) => {
+                let dir = pax_core::default_backup_dir(&self.root);
+                if !dir.is_dir() {
+                    return Err(format!(
+                        "no backup in {}: `export` with `format: \"pdfs\"` and no `dir` \
+                         writes one there",
+                        dir.display()
+                    ));
+                }
+                Some(dir)
+            }
+            (None, false) => None,
         };
         let root = self.root.clone();
         let reports = tokio::task::spawn_blocking(move || match from {
@@ -1147,6 +1206,18 @@ fn failed_fetch(citation_key: &str, e: &PaxError) -> FetchResult {
 
 /// pax-core's [`SyncResults`], with each failed paper's reason worded as
 /// `fetch` words it.
+/// The warning for a `pdfs` export to `directory`, inside `research/` and
+/// not ignored by git: pax-core's CLI warning, worded for the agent.
+fn staged_by_git_warning(directory: &str) -> String {
+    format!(
+        "{directory} is in research/ but not ignored by git; pax stages research/ \
+         for git (`git add -A`) before every build, so these PDFs would be \
+         committed with the library. Leave `dir` out to use the default \
+         research/.pdfs/, choose one outside research/, or add this one to \
+         research/.gitignore"
+    )
+}
+
 fn sync_results(reports: &[SyncReport]) -> SyncResults {
     let mut results = SyncResults::new(reports);
     for (result, report) in results.papers.iter_mut().zip(reports) {
@@ -2625,11 +2696,18 @@ mod tests {
         })
     }
 
-    /// A `pdfs` export's result.
+    /// A `pdfs` export's result, with no warnings.
     fn pdfs(output: Result<Json<ExportOutput>, String>) -> ExportedPdfs {
+        let (exported, warnings) = pdfs_warned(output);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        exported
+    }
+
+    /// A `pdfs` export's result and its warnings.
+    fn pdfs_warned(output: Result<Json<ExportOutput>, String>) -> (ExportedPdfs, Vec<String>) {
         let Json(output) = output.unwrap();
         assert!(output.text.is_none());
-        output.pdfs.expect("a pdfs export")
+        (output.pdfs.expect("a pdfs export"), output.warnings)
     }
 
     /// Clears the fixture's hashes, so it has no local artifact (turing1936's
@@ -2643,11 +2721,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_pdfs_needs_a_dir_and_selects_no_papers() {
+    async fn export_pdfs_refuses_a_blank_dir_and_selects_no_papers() {
         let root = library_with_two_papers("export-pdfs-refused");
         let server = PaxServer::new(root.clone(), Config::default());
 
-        for dir in [None, Some(""), Some("  ")] {
+        for dir in [Some(""), Some("  ")] {
             let error = server.export(pdfs_to(dir)).await.err().unwrap();
             assert!(error.contains("`dir`"), "{error}");
         }
@@ -2660,11 +2738,15 @@ mod tests {
         let error = server.export(bibtex_to_dir).await.err().unwrap();
         assert!(error.contains("`dir`"), "{error}");
         assert!(!root.join("backup").exists());
+        assert!(!pax_core::default_backup_dir(&root).exists());
 
         let parsed: ExportParams =
             serde_json::from_value(serde_json::json!({ "format": "pdfs", "dir": "backup" }))
                 .unwrap();
         assert!(matches!(parsed.format, ExportFormat::Pdfs));
+        let parsed: ExportParams =
+            serde_json::from_value(serde_json::json!({ "format": "pdfs" })).unwrap();
+        assert!(parsed.dir.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2691,6 +2773,111 @@ mod tests {
             fs::read_to_string(dir.join("manifest.json")).unwrap(),
             "{}\n"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_pdfs_defaults_to_the_ignored_research_pdfs() {
+        let root = library_with_two_papers("export-pdfs-default");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let exported = pdfs(server.export(pdfs_to(None)).await);
+        let dir = pax_core::default_backup_dir(&root);
+        assert_eq!(dir, root.join("research/.pdfs"));
+        assert_eq!(exported.directory, dir.display().to_string());
+        assert_eq!(
+            fs::read_to_string(dir.join("manifest.json")).unwrap(),
+            "{}\n"
+        );
+        let gitignore = fs::read_to_string(root.join("research/.gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l == ".pdfs/"), "{gitignore}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether `git` can run here; the tracked-folder warning needs it.
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[tokio::test]
+    async fn export_pdfs_warns_about_a_dir_git_would_commit() {
+        if !git_available() {
+            eprintln!("skipped: git isn't available");
+            return;
+        }
+        let root = library_with_two_papers("export-pdfs-staged");
+        without_hashes(&root);
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let (exported, warnings) = pdfs_warned(server.export(pdfs_to(Some("research/pdfs"))).await);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        assert!(
+            warning.contains(&exported.directory)
+                && warning.contains("committed")
+                && warning.contains("research/.pdfs/"),
+            "{warning}"
+        );
+        let Json(output) = server.export(pdfs_to(Some("research/pdfs"))).await.unwrap();
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["warnings"][0], serde_json::json!(warning));
+
+        // The default and a directory outside research/ aren't committed.
+        pdfs(server.export(pdfs_to(None)).await);
+        let Json(output) = server.export(pdfs_to(Some("backup"))).await.unwrap();
+        assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json.get("warnings").is_none(), "{json}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_from_backup_takes_the_default_dir_alone() {
+        let root = library_with_two_papers("sync-from-backup");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let both = server
+            .sync(Parameters(SyncParams {
+                from: Some("backup".to_string()),
+                from_backup: true,
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert!(both.contains("not both"), "{both}");
+        let none_yet = server.sync(sync_from_backup()).await.err().unwrap();
+        assert!(
+            none_yet.contains("research/.pdfs") && none_yet.contains("`export`"),
+            "{none_yet}"
+        );
+
+        // No paper has a hash or a source URL, so nothing runs `nix`.
+        pdfs(server.export(pdfs_to(None)).await);
+        let Json(synced) = server.sync(sync_from_backup()).await.unwrap();
+        let keys: Vec<_> = synced.papers.iter().map(|p| &p.citation_key).collect();
+        assert_eq!(keys, ["turing1936", "hewitt1973"]);
+
+        let parsed: SyncParams =
+            serde_json::from_value(serde_json::json!({ "from_backup": true })).unwrap();
+        assert!(parsed.from_backup && parsed.from.is_none());
+        let parsed: SyncParams =
+            serde_json::from_value(serde_json::json!({ "from": "backup" })).unwrap();
+        assert!(!parsed.from_backup);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3192,7 +3379,47 @@ mod tests {
     fn sync_from(from: Option<&str>) -> Parameters<SyncParams> {
         Parameters(SyncParams {
             from: from.map(str::to_string),
+            from_backup: false,
         })
+    }
+
+    fn sync_from_backup() -> Parameters<SyncParams> {
+        Parameters(SyncParams {
+            from: None,
+            from_backup: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_default_backup_dir_round_trips_through_export_and_sync() {
+        if !nix_available() {
+            eprintln!("skipped: nix isn't available");
+            return;
+        }
+        let mut scratch = StoreScratch::new(library_with_two_papers("default-backup"));
+        let root = scratch.root.clone();
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        let content = "%PDF-1.4 pax-ai default backup test\n";
+        let hash = add_local_pdf(&server, &mut scratch, "hewitt1973", content).await;
+        let store_path = scratch.store_paths[0].clone();
+
+        let exported = pdfs(server.export(pdfs_to(None)).await);
+        assert_eq!(exported.exported, 1);
+        let file = pax_core::default_backup_dir(&root).join("hewitt1973.pdf");
+        assert_eq!(exported.papers[0].file.as_deref(), file.to_str());
+        assert_eq!(fs::read_to_string(&file).unwrap(), content);
+
+        drop_from_store(&root, "hewitt1973", &store_path);
+        let Json(restored) = server.sync(sync_from_backup()).await.unwrap();
+        let hewitt = restored
+            .papers
+            .iter()
+            .find(|p| p.citation_key == "hewitt1973")
+            .unwrap();
+        assert_eq!(hewitt.status, FetchState::Fetched, "{:?}", hewitt.reason);
+        assert_eq!(hewitt.hash.as_deref(), Some(hash.as_str()));
+        assert!(Path::new(&store_path).exists());
     }
 
     #[tokio::test]
