@@ -22,7 +22,7 @@ mcp = ["dep:rmcp", "dep:schemars", "dep:tokio", "pax-core/schemars"]
 [dependencies]
 pax-core = { package = "pax-core-papers", version = "3.2", default-features = false }
 reqwest = { version = "0.12", features = ["json"] }
-rmcp = { version = "3.6", features = ["server", "macros", "transport-io"], optional = true }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-io"], optional = true }
 schemars = { version = "1.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
