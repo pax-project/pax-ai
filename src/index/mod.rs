@@ -137,6 +137,22 @@ impl PaperIndex {
                 None => PaxError::NoSuchPaper(name.to_string()),
             });
         };
+        Ok(self.paper_vectors(paper, model_id))
+    }
+
+    /// Every declared paper's vector set, in `papers.nix` order: what
+    /// `similar` and `search` rank over. A paper with no entries for
+    /// `model_id` (not indexed yet) has empty `chunks`.
+    pub fn all_vectors(&self, model_id: &str) -> Result<Vec<PaperVectors>, PaxError> {
+        let library = Library::load(&pax_core::nix::papers_path(&self.root))?;
+        Ok(library
+            .papers()
+            .iter()
+            .map(|paper| self.paper_vectors(paper, model_id))
+            .collect())
+    }
+
+    fn paper_vectors(&self, paper: &Paper, model_id: &str) -> PaperVectors {
         let keys = PaperKeys::of(paper, model_id);
         let mut chunks = self
             .store
@@ -146,11 +162,11 @@ impl PaperIndex {
         let full_text = keys.full_text.and_then(|key| self.store.get(&key));
         let fallback = full_text.is_none();
         chunks.extend(full_text.into_iter().flat_map(|entry| entry.chunks));
-        Ok(PaperVectors {
+        PaperVectors {
             citation_key: paper.local.citation_key.clone(),
             fallback,
             chunks,
-        })
+        }
     }
 
     async fn build_paper(
@@ -602,6 +618,32 @@ pub(crate) mod tests {
             index.vectors("fake:model", "nobody"),
             Err(PaxError::NoSuchPaper(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn all_vectors_lists_every_paper_in_order_indexed_or_not() {
+        let scratch = library("all", &[paper("a2020", "Attention", None, None)]);
+        let index = PaperIndex::open(&scratch.0);
+        index.build(&FakeEmbedder::new()).await.unwrap();
+        write_papers(
+            &scratch.0,
+            &[
+                paper("a2020", "Attention", None, None),
+                paper("b2020", "Bert", None, None),
+            ],
+        );
+
+        let all = index.all_vectors("fake:model").unwrap();
+        let keys: Vec<&str> = all.iter().map(|v| v.citation_key.as_str()).collect();
+        assert_eq!(keys, ["a2020", "b2020"]);
+        assert_eq!(all[0], index.vectors("fake:model", "a2020").unwrap());
+        assert!(all[0].fallback && all[0].chunks.len() == 1);
+        assert!(all[1].chunks.is_empty(), "b2020 isn't indexed yet");
+        assert!(
+            index.all_vectors("other:model").unwrap()[0]
+                .chunks
+                .is_empty()
+        );
     }
 
     #[tokio::test]
