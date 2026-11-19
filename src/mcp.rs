@@ -11,6 +11,8 @@
 //! field; only `show`'s DOI lookup, which the CLI lacks, wraps one. The
 //! exception is `index`, which builds pax-ai's own embedding index
 //! ([`PaperIndex`]) through an [`Embedder`] and returns its [`BuildReport`].
+//! `semantic_search` ranks over that index and returns its
+//! [`SemanticResults`].
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -20,7 +22,7 @@ use std::time::Duration;
 
 use crate::adapter::ollama::OllamaAdapter;
 use crate::blocking::blocking_with_timeout;
-use crate::index::{BuildReport, PaperIndex, Similar};
+use crate::index::{BuildReport, PaperIndex, SemanticResults, Similar};
 use crate::port::Embedder;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
@@ -360,6 +362,14 @@ pub struct ExportOutput {
     /// there's nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SemanticSearchParams {
+    /// What to look for, in plain words: a theme, a claim, a method.
+    pub query: String,
+    /// Return at most this many papers (default 10).
+    pub limit: Option<usize>,
 }
 
 /// What `show` found. For a `reference`, pax-core's [`Shown`]: exactly one of
@@ -959,6 +969,24 @@ impl PaxServer {
         self.index_with(self.embedder.as_ref()).await
     }
 
+    /// Search the library's declared papers by meaning, over the embedding
+    /// index `index` builds: the query is embedded by the local Ollama
+    /// server and each paper is scored by its closest passage of full text
+    /// (or its title and venue, for a `fallback` paper with no PDF
+    /// indexed). Returns one hit per paper, best first, with that passage
+    /// as `chunk` and its cosine `score`, and lists the `unindexed` papers
+    /// by citation key: run `index` to add them. Use it to find papers
+    /// discussing a theme or arguing against a claim; `search` finds new
+    /// papers from providers instead.
+    #[tool]
+    async fn semantic_search(
+        &self,
+        Parameters(params): Parameters<SemanticSearchParams>,
+    ) -> Result<Json<SemanticResults>, String> {
+        self.semantic_search_with(self.embedder.as_ref(), params)
+            .await
+    }
+
     /// Recommend the library's papers most related to one declared paper
     /// by meaning, from the embedding index (`index` builds it): each
     /// paper's full text and title, compared chunk by chunk, so it finds
@@ -1007,6 +1035,29 @@ impl PaxServer {
         self.papers_path()?;
         PaperIndex::open(&self.root)
             .build(embedder)
+            .await
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `semantic_search` with `embedder`, so tests can search offline.
+    async fn semantic_search_with(
+        &self,
+        embedder: &impl Embedder,
+        params: SemanticSearchParams,
+    ) -> Result<Json<SemanticResults>, String> {
+        let query = params.query.trim();
+        if query.is_empty() {
+            return Err("`query` is blank: say what to look for".to_string());
+        }
+        let limit = match params.limit {
+            Some(0) => return Err("`limit` must be at least 1".to_string()),
+            Some(n) => n,
+            None => 10,
+        };
+        self.papers_path()?;
+        PaperIndex::open(&self.root)
+            .search(embedder, query, limit)
             .await
             .map(Json)
             .map_err(|e| e.to_string())
@@ -1087,6 +1138,8 @@ impl ServerHandler for PaxServer {
                  (index), through a local Ollama server, and recommend the \
                  library's papers closest in meaning to one of them from it \
                  (similar). \
+                 Search the declared papers by meaning over that index, \
+                 each with its best-matching passage (semantic_search). \
                  A paper can carry an alias, such as the review's study ID \
                  P17, set with edit (declared papers) or exclude (excluded \
                  ones): every tool that takes a citation key also takes an \
@@ -1384,6 +1437,7 @@ mod tests {
     use crate::index::PaperStatus;
     use crate::index::extract::tests::{pdf_with_lines, pdftotext_available};
     use crate::index::tests::FakeEmbedder;
+    use crate::port::EmbedKind;
     use pax_core::output::SearchLogStatus;
     use pax_core::{CandidateWork, Exclusion, Exclusions, LogOutcome, ProviderError};
     use std::fs;
@@ -1470,6 +1524,7 @@ mod tests {
                 "refs",
                 "related",
                 "search",
+                "semantic_search",
                 "show",
                 "similar",
                 "stats",
@@ -3745,6 +3800,11 @@ mod tests {
                     assert!(properties.contains_key(field), "{field}");
                 }
             }
+            if tool.name == "semantic_search" {
+                for field in ["hits", "unindexed"] {
+                    assert_eq!(schema["properties"][field]["type"], "array", "{schema:?}");
+                }
+            }
         }
     }
 
@@ -3849,6 +3909,13 @@ mod tests {
         }
     }
 
+    fn semantic(query: &str, limit: Option<usize>) -> SemanticSearchParams {
+        SemanticSearchParams {
+            query: query.to_string(),
+            limit,
+        }
+    }
+
     #[tokio::test]
     async fn similar_recommends_the_other_indexed_papers() {
         let root = library_with_two_papers("similar");
@@ -3899,6 +3966,72 @@ mod tests {
             panic!("ran without a library");
         };
         assert!(error.contains("no pax library"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_search_refuses_a_blank_query_a_zero_limit_and_no_library() {
+        let root = library_with_two_papers("semantic-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+        let embedder = FakeEmbedder::new();
+        for (params, expected) in [
+            (semantic("  ", None), "blank"),
+            (semantic("actors", Some(0)), "at least 1"),
+        ] {
+            let Err(error) = server.semantic_search_with(&embedder, params).await else {
+                panic!("searched with {expected}");
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(embedder.kinds.lock().unwrap().is_empty());
+
+        let server = PaxServer::new(PathBuf::from("/nonexistent/pax-mcp"), Config::default());
+        let Err(error) = server
+            .semantic_search_with(&embedder, semantic("actors", None))
+            .await
+        else {
+            panic!("searched without a library");
+        };
+        assert!(error.contains("no pax library"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_search_ranks_indexed_papers_and_lists_the_unindexed() {
+        let root = library_with_two_papers("semantic");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+        // turing1936's title fails to embed, so it isn't indexed at all.
+        let Json(report) = server
+            .index_with(&FakeEmbedder::failing_on("Computable"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(report.papers[0].status, PaperStatus::Failed { .. }),
+            "{report:?}"
+        );
+
+        let embedder = FakeEmbedder::new();
+        let Json(results) = server
+            .semantic_search_with(
+                &embedder,
+                semantic(" A Universal Modular Actor Formalism ", None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*embedder.kinds.lock().unwrap(), [EmbedKind::Query]);
+        let [hit] = &results.hits[..] else {
+            panic!("{results:?}");
+        };
+        assert_eq!(hit.citation_key, "hewitt1973");
+        assert_eq!(hit.chunk, "A Universal Modular Actor Formalism");
+        assert!(hit.fallback);
+        assert!((hit.score - 1.0).abs() < 1e-5, "{hit:?}");
+        assert_eq!(results.unindexed, ["turing1936"]);
+        let json = serde_json::to_value(&results).unwrap();
+        assert_eq!(json["hits"][0]["citation_key"], "hewitt1973");
 
         fs::remove_dir_all(root).unwrap();
     }

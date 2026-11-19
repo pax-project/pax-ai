@@ -405,19 +405,104 @@ async fn embed_documents(
         .collect())
 }
 
+// Full-text semantic search (#8).
+
+/// Why [`PaperIndex::search`] couldn't run: `papers.nix` couldn't be read,
+/// or the query couldn't be embedded.
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    #[error(transparent)]
+    Library(#[from] PaxError),
+    #[error(transparent)]
+    Embed(#[from] crate::error::PortError),
+}
+
+/// One paper matching a [`PaperIndex::search`] query, by its best chunk.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct SearchHit {
+    pub citation_key: String,
+    /// Cosine similarity of the best-matching chunk to the query.
+    pub score: f32,
+    /// That chunk's text (the title + venue text for a fallback paper).
+    pub chunk: String,
+    /// Only the paper's title + venue is indexed (no full text).
+    pub fallback: bool,
+}
+
+/// What [`PaperIndex::search`] found: hits best first, and the declared
+/// papers not indexed for the embedder's model, which `build` would add.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct SemanticResults {
+    pub hits: Vec<SearchHit>,
+    /// Citation keys, in `papers.nix` order.
+    pub unindexed: Vec<String>,
+}
+
+impl PaperIndex {
+    /// Embeds `query` as `EmbedKind::Query`, normalizes it, scores each paper by
+    /// `best_chunk`, best first, at most `limit`, one hit per paper.
+    ///
+    /// Ranks over [`PaperIndex::all_vectors`] for the embedder's model, so
+    /// `papers.nix` is read before the embedder is called; ties keep
+    /// `papers.nix` order.
+    pub async fn search(
+        &self,
+        embedder: &impl Embedder,
+        query: &str,
+        limit: usize,
+    ) -> Result<SemanticResults, SearchError> {
+        let papers = self.all_vectors(embedder.model_id())?;
+        let vectors = embedder.embed(&[query], EmbedKind::Query).await?;
+        let mut query = match <[Vec<f32>; 1]>::try_from(vectors) {
+            Ok([vector]) => vector,
+            Err(vectors) => {
+                return Err(crate::error::PortError::UnexpectedResponse(format!(
+                    "the embedder returned {} vectors for one query",
+                    vectors.len()
+                ))
+                .into());
+            }
+        };
+        similarity::normalize(&mut query);
+
+        let mut hits = Vec::new();
+        let mut unindexed = Vec::new();
+        for paper in papers {
+            let chunks: Vec<&[f32]> = paper.chunks.iter().map(|c| c.vector.as_slice()).collect();
+            match similarity::best_chunk(&query, &chunks) {
+                Some((best, score)) => hits.push(SearchHit {
+                    chunk: paper.chunks[best].text.clone(),
+                    citation_key: paper.citation_key,
+                    score,
+                    fallback: paper.fallback,
+                }),
+                None => unindexed.push(paper.citation_key),
+            }
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(limit);
+        Ok(SemanticResults { hits, unindexed })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::error::PortError;
     use std::fs;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// An offline [`Embedder`]: a text's vector is derived from its bytes
     /// (so equal texts get equal vectors), and any text containing
-    /// `fail_on` fails the whole call. Counts the texts it embeds.
+    /// `fail_on` fails the whole call. Counts the texts it embeds, and
+    /// records the kind of each call.
     pub(crate) struct FakeEmbedder {
         pub(crate) fail_on: Option<&'static str>,
         pub(crate) embedded: AtomicUsize,
+        pub(crate) kinds: Mutex<Vec<EmbedKind>>,
     }
 
     impl FakeEmbedder {
@@ -425,6 +510,7 @@ pub(crate) mod tests {
             FakeEmbedder {
                 fail_on: None,
                 embedded: AtomicUsize::new(0),
+                kinds: Mutex::new(Vec::new()),
             }
         }
 
@@ -446,7 +532,7 @@ pub(crate) mod tests {
         }
 
         async fn embed(&self, texts: &[&str], kind: EmbedKind) -> Result<Vec<Vec<f32>>, PortError> {
-            assert_eq!(kind, EmbedKind::Document);
+            self.kinds.lock().unwrap().push(kind);
             if let Some(marker) = self.fail_on
                 && texts.iter().any(|t| t.contains(marker))
             {
@@ -873,6 +959,150 @@ pub(crate) mod tests {
                 { "citation_key": "a", "status": "indexed", "chunks": 3 },
                 { "citation_key": "b", "status": "fallback", "reason": "no PDF" },
             ]})
+        );
+    }
+
+    // Full-text semantic search (#8).
+
+    /// `text`'s normalized vector under [`FakeEmbedder`], as `build` stores it.
+    async fn fake_vector(text: &str) -> Vec<f32> {
+        let mut vector = FakeEmbedder::new()
+            .embed(&[text], EmbedKind::Document)
+            .await
+            .unwrap()
+            .remove(0);
+        similarity::normalize(&mut vector);
+        vector
+    }
+
+    #[tokio::test]
+    async fn search_embeds_the_query_as_a_query_and_ranks_papers_by_their_best_chunk() {
+        let scratch = library(
+            "search",
+            &[
+                paper("a2020", "Attention", Some("NeurIPS"), None),
+                paper("b2020", "Bert", None, None),
+            ],
+        );
+        let index = PaperIndex::open(&scratch.0);
+        index.build(&FakeEmbedder::new()).await.unwrap();
+        write_papers(
+            &scratch.0,
+            &[
+                paper("a2020", "Attention", Some("NeurIPS"), None),
+                paper("b2020", "Bert", None, None),
+                paper("c2020", "Unbuilt", None, None),
+            ],
+        );
+
+        let embedder = FakeEmbedder::new();
+        let results = index.search(&embedder, "Bert", 10).await.unwrap();
+        assert_eq!(*embedder.kinds.lock().unwrap(), [EmbedKind::Query]);
+        let keys: Vec<&str> = results
+            .hits
+            .iter()
+            .map(|h| h.citation_key.as_str())
+            .collect();
+        assert_eq!(keys, ["b2020", "a2020"], "one hit per indexed paper");
+        let best = &results.hits[0];
+        assert_eq!(best.chunk, "Bert");
+        assert!(best.fallback);
+        assert!((best.score - 1.0).abs() < 1e-5, "{best:?}");
+        assert!(results.hits[1].score < best.score);
+        assert_eq!(results.hits[1].chunk, "Attention\nNeurIPS");
+        assert_eq!(results.unindexed, ["c2020"]);
+
+        let top = index.search(&embedder, "Bert", 1).await.unwrap();
+        assert_eq!(top.hits, results.hits[..1]);
+        assert_eq!(top.unindexed, ["c2020"]);
+    }
+
+    #[tokio::test]
+    async fn search_returns_a_full_text_chunk_as_the_hit() {
+        let scratch = library("search-full-text", &[]);
+        let with_hash = paper("a2020", "Attention", None, None)
+            .replace("hash = null", "hash = \"sha256-AAAA\"");
+        write_papers(&scratch.0, &[with_hash]);
+        let index = PaperIndex::open(&scratch.0);
+        let chunk = |text: &str, vector: Vec<f32>| StoredChunk {
+            text: text.to_string(),
+            vector,
+        };
+        index.store.put(
+            &EntryKey::TitleVenue {
+                model_id: "fake:model".to_string(),
+                text: "Attention".to_string(),
+            },
+            &Entry {
+                chunks: vec![chunk("Attention", fake_vector("Attention").await)],
+            },
+        );
+        index.store.put(
+            &EntryKey::FullText {
+                model_id: "fake:model".to_string(),
+                artifact_hash: "sha256-AAAA".to_string(),
+                extractor_version: extract::EXTRACTOR_VERSION,
+                chunker_version: chunk::CHUNKER_VERSION,
+            },
+            &Entry {
+                chunks: vec![
+                    chunk("an introduction", fake_vector("an introduction").await),
+                    chunk(
+                        "self-attention layers",
+                        fake_vector("self-attention layers").await,
+                    ),
+                ],
+            },
+        );
+
+        let results = index
+            .search(&FakeEmbedder::new(), "self-attention layers", 10)
+            .await
+            .unwrap();
+        let [hit] = &results.hits[..] else {
+            panic!("{results:?}");
+        };
+        assert_eq!(hit.citation_key, "a2020");
+        assert_eq!(hit.chunk, "self-attention layers");
+        assert!(!hit.fallback);
+        assert!(results.unindexed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_errors_tell_the_library_from_the_embedder() {
+        let scratch = library("search-errors", &[paper("a2020", "Attention", None, None)]);
+        let index = PaperIndex::open(&scratch.0);
+        let failed = index
+            .search(&FakeEmbedder::failing_on("down"), "is it down", 10)
+            .await;
+        assert!(matches!(failed, Err(SearchError::Embed(_))), "{failed:?}");
+
+        let missing = PaperIndex::open(Path::new("/nonexistent/pax-ai-index"))
+            .search(&FakeEmbedder::new(), "anything", 10)
+            .await;
+        assert!(
+            matches!(missing, Err(SearchError::Library(_))),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_results_serialize_flat() {
+        let results = SemanticResults {
+            hits: vec![SearchHit {
+                citation_key: "a".to_string(),
+                score: 0.5,
+                chunk: "text".to_string(),
+                fallback: true,
+            }],
+            unindexed: vec!["b".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&results).unwrap(),
+            serde_json::json!({
+                "hits": [{ "citation_key": "a", "score": 0.5, "chunk": "text", "fallback": true }],
+                "unindexed": ["b"],
+            })
         );
     }
 }
