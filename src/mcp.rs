@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crate::adapter::ollama::OllamaAdapter;
 use crate::blocking::blocking_with_timeout;
-use crate::index::{BuildReport, PaperIndex, SemanticResults};
+use crate::index::{BuildReport, PaperIndex, SemanticResults, Similar};
 use crate::port::Embedder;
 use pax_core::output::{
     Added, CheckResults, CheckState, CitationResults, DeclaredPaper, DoiRecords, Excluded,
@@ -385,6 +385,18 @@ pub struct ShowOutput {
     pub records: Option<DoiRecords>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SimilarParams {
+    /// The citation key or alias of a paper in the library, e.g.
+    /// `turing1936` or `P17`.
+    pub name: String,
+    /// How many papers to return, best first (default 10).
+    pub limit: Option<usize>,
+}
+
+/// How many papers `similar` returns without a `limit`.
+const SIMILAR_LIMIT: usize = 10;
+
 /// Serves one research library: `root` is the directory containing
 /// `research/`, as for the `pax` CLI.
 #[derive(Clone)]
@@ -392,6 +404,7 @@ pub struct PaxServer {
     root: PathBuf,
     config: Config,
     /// What `index` embeds with: a local Ollama server's `nomic-embed-text`.
+    /// `similar` reads the entries of its `model_id`, without calling it.
     embedder: Arc<OllamaAdapter>,
     tool_router: ToolRouter<Self>,
 }
@@ -973,6 +986,47 @@ impl PaxServer {
         self.semantic_search_with(self.embedder.as_ref(), params)
             .await
     }
+
+    /// Recommend the library's papers most related to one declared paper
+    /// by meaning, from the embedding index (`index` builds it): each
+    /// paper's full text and title, compared chunk by chunk, so it finds
+    /// papers on the same topic whether or not they cite each other (for
+    /// citation-based recommendations from providers, use `related`).
+    /// Returns up to `limit` papers (default 10), best first, each with a
+    /// `score` (higher is closer, at most 1) and `fallback` when only its
+    /// title and venue are indexed, which makes its score less reliable;
+    /// `seed_fallback` says the same of the paper asked about. `unindexed`
+    /// lists the declared papers not in the index (the seed too, if it
+    /// isn't, and then nothing is recommended): run `index` to add them.
+    /// Reads the index only; nothing is embedded.
+    #[tool]
+    async fn similar(
+        &self,
+        Parameters(params): Parameters<SimilarParams>,
+    ) -> Result<Json<Similar>, String> {
+        self.similar_with(self.embedder.model_id(), params)
+    }
+}
+
+impl PaxServer {
+    /// `similar` over the index entries of `model_id`, so tests can read
+    /// what they indexed with a fake embedder.
+    fn similar_with(&self, model_id: &str, params: SimilarParams) -> Result<Json<Similar>, String> {
+        let limit = match params.limit {
+            Some(0) => return Err("`limit` must be at least 1".to_string()),
+            Some(n) => n,
+            None => SIMILAR_LIMIT,
+        };
+        let name = params.name.trim();
+        if name.is_empty() {
+            return Err("`name` must be a citation key or alias, e.g. `turing1936`".to_string());
+        }
+        self.papers_path()?;
+        PaperIndex::open(&self.root)
+            .similar(model_id, name, limit)
+            .map(Json)
+            .map_err(name_error)
+    }
 }
 
 impl PaxServer {
@@ -1081,7 +1135,9 @@ impl ServerHandler for PaxServer {
                  directory on this machine (export), and report PRISMA flow \
                  counts (stats). Build or update the library's embedding \
                  index of titles, venues and fetched PDFs' full text \
-                 (index), through a local Ollama server. \
+                 (index), through a local Ollama server, and recommend the \
+                 library's papers closest in meaning to one of them from it \
+                 (similar). \
                  Search the declared papers by meaning over that index, \
                  each with its best-matching passage (semantic_search). \
                  A paper can carry an alias, such as the review's study ID \
@@ -1470,6 +1526,7 @@ mod tests {
                 "search",
                 "semantic_search",
                 "show",
+                "similar",
                 "stats",
                 "sync",
                 "unexclude",
@@ -3737,6 +3794,12 @@ mod tests {
                 let papers = &schema["properties"]["papers"];
                 assert_eq!(papers["type"], "array", "{schema:?}");
             }
+            if tool.name == "similar" {
+                let properties = schema["properties"].as_object().unwrap();
+                for field in ["seed", "seed_fallback", "papers", "unindexed"] {
+                    assert!(properties.contains_key(field), "{field}");
+                }
+            }
             if tool.name == "semantic_search" {
                 for field in ["hits", "unindexed"] {
                     assert_eq!(schema["properties"][field]["type"], "array", "{schema:?}");
@@ -3839,11 +3902,72 @@ mod tests {
         );
     }
 
+    fn similar_to(name: &str, limit: Option<usize>) -> SimilarParams {
+        SimilarParams {
+            name: name.to_string(),
+            limit,
+        }
+    }
+
     fn semantic(query: &str, limit: Option<usize>) -> SemanticSearchParams {
         SemanticSearchParams {
             query: query.to_string(),
             limit,
         }
+    }
+
+    #[tokio::test]
+    async fn similar_recommends_the_other_indexed_papers() {
+        let root = library_with_two_papers("similar");
+        without_hashes(&root);
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        let Json(before) = server
+            .similar_with("fake:model", similar_to("hewitt1973", None))
+            .unwrap();
+        assert!(before.papers.is_empty());
+        assert_eq!(before.unindexed, ["turing1936", "hewitt1973"]);
+
+        server.index_with(&FakeEmbedder::new()).await.unwrap();
+        let Json(after) = server
+            .similar_with("fake:model", similar_to("hewitt1973", None))
+            .unwrap();
+        assert_eq!(after.seed, "hewitt1973");
+        assert!(after.seed_fallback);
+        assert!(after.unindexed.is_empty());
+        let [paper] = &after.papers[..] else {
+            panic!("{after:?}");
+        };
+        assert_eq!(paper.citation_key, "turing1936");
+        assert!(paper.fallback);
+        let json = serde_json::to_value(&after).unwrap();
+        assert_eq!(json["papers"][0]["citation_key"], "turing1936");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn similar_refuses_a_zero_limit_a_blank_name_and_unknown_papers() {
+        let root = library_with_two_papers("similar-refused");
+        let server = PaxServer::new(root.clone(), Config::default());
+
+        for (params, expected) in [
+            (similar_to("hewitt1973", Some(0)), "`limit`"),
+            (similar_to("  ", None), "`name`"),
+            (similar_to("nobody", None), "nobody"),
+        ] {
+            let Err(error) = server.similar_with("fake:model", params) else {
+                panic!("accepted a bad request");
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        let server = PaxServer::new(PathBuf::from("/nonexistent/pax-mcp"), Config::default());
+        let Err(error) = server.similar_with("fake:model", similar_to("hewitt1973", None)) else {
+            panic!("ran without a library");
+        };
+        assert!(error.contains("no pax library"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
