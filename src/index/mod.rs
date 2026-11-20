@@ -32,6 +32,10 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long `pdftotext` may take on one PDF.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long OCR may take on one scanned PDF: tens of pages, each rendered
+/// and read by `tesseract`, take minutes.
+const OCR_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// The most chunks sent to the embedder in one call.
 const EMBED_BATCH: usize = 32;
 
@@ -63,7 +67,13 @@ pub struct PaperReport {
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum PaperStatus {
     /// Its title + venue vector and `chunks` full-text chunks are stored.
-    Indexed { chunks: usize },
+    /// `ocr` is set when this build read the text by OCR (a scanned PDF);
+    /// a full-text entry reused from an earlier build doesn't record it.
+    Indexed {
+        chunks: usize,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ocr: bool,
+    },
     /// Only its title + venue vector is stored: no PDF on this machine, or
     /// its text couldn't be extracted or embedded.
     Fallback { reason: String },
@@ -195,10 +205,11 @@ impl PaperIndex {
         if let Some(entry) = self.store.get(full_text_key) {
             return PaperStatus::Indexed {
                 chunks: entry.chunks.len(),
+                ocr: false,
             };
         }
-        let chunks = match self.full_text_chunks(&paper.local.citation_key).await {
-            Ok(chunks) => chunks,
+        let (chunks, ocr) = match self.full_text_chunks(&paper.local.citation_key).await {
+            Ok(text) => text,
             Err(reason) => return PaperStatus::Fallback { reason },
         };
         let mut stored = Vec::with_capacity(chunks.len());
@@ -215,12 +226,16 @@ impl PaperIndex {
         }
         let count = stored.len();
         self.store.put(full_text_key, &Entry { chunks: stored });
-        PaperStatus::Indexed { chunks: count }
+        PaperStatus::Indexed { chunks: count, ocr }
     }
 
-    /// The paper's PDF, resolved through pax-core, extracted and chunked;
-    /// the fallback reason when there's no text to embed.
-    async fn full_text_chunks(&self, citation_key: &str) -> Result<Vec<chunk::Chunk>, String> {
+    /// The paper's PDF, resolved through pax-core, extracted and chunked,
+    /// and whether the text came from OCR; the fallback reason when there's
+    /// no text to embed.
+    async fn full_text_chunks(
+        &self,
+        citation_key: &str,
+    ) -> Result<(Vec<chunk::Chunk>, bool), String> {
         let (key, root) = (citation_key.to_string(), self.root.clone());
         let resolved = blocking_with_timeout(RESOLVE_TIMEOUT, move || {
             pax_core::resolve_artifact_path(&key, &root)
@@ -240,22 +255,63 @@ impl PaperIndex {
             Err(PaxError::LocalArtifactMissing(_)) => return Err(LOCAL_MISSING.to_string()),
             Err(e) => return Err(format!("the PDF couldn't be resolved: {e}")),
         };
-        let text = blocking_with_timeout(EXTRACT_TIMEOUT, move || extract::extract_text(&pdf))
-            .await
-            .map_err(|e| format!("extracting the text failed: {e}"))?
-            .ok_or_else(|| {
-                format!(
-                    "pdftotext didn't finish within {}s",
-                    EXTRACT_TIMEOUT.as_secs()
-                )
-            })?
-            .map_err(|e| e.to_string())?;
+        let (text, ocr) = pdf_text(pdf).await?;
         let chunks = chunk::chunk(&text);
         if chunks.is_empty() {
             return Err(extract::ExtractError::Empty.to_string());
         }
-        Ok(chunks)
+        Ok((chunks, ocr))
     }
+}
+
+/// A PDF's text, and whether it came from OCR: its text layer, unless it
+/// has none or only a sparse one ([`extract::is_sparse`]), when OCR reads
+/// it instead. With no text layer, an OCR failure or timeout is the
+/// fallback reason; with a sparse one, the text layer is kept, as it was
+/// before OCR, and so is a sparse layer OCR reads less text from.
+async fn pdf_text(pdf: PathBuf) -> Result<(String, bool), String> {
+    let layer_pdf = pdf.clone();
+    let layer = blocking_with_timeout(EXTRACT_TIMEOUT, move || {
+        let text = extract::extract_text(&layer_pdf)?;
+        // A PDF whose pages can't be counted keeps its text layer.
+        let sparse =
+            extract::page_count(&layer_pdf).is_ok_and(|pages| extract::is_sparse(&text, pages));
+        Ok((text, sparse))
+    })
+    .await
+    .map_err(|e| format!("extracting the text failed: {e}"))?
+    .ok_or_else(|| {
+        format!(
+            "pdftotext didn't finish within {}s",
+            EXTRACT_TIMEOUT.as_secs()
+        )
+    })?;
+    match layer {
+        Ok((text, false)) => Ok((text, false)),
+        Ok((text, true)) => match ocr_text(pdf).await {
+            Ok(read) if non_whitespace(&read) > non_whitespace(&text) => Ok((read, true)),
+            _ => Ok((text, false)),
+        },
+        Err(extract::ExtractError::Empty) => ocr_text(pdf)
+            .await
+            .map(|read| (read, true))
+            .map_err(|reason| format!("the PDF has no text layer, and {reason}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `extract::ocr_text` on the blocking pool, within `OCR_TIMEOUT`; the
+/// reason it gave no text.
+async fn ocr_text(pdf: PathBuf) -> Result<String, String> {
+    blocking_with_timeout(OCR_TIMEOUT, move || extract::ocr_text(&pdf))
+        .await
+        .map_err(|e| format!("OCR failed: {e}"))?
+        .ok_or_else(|| format!("OCR didn't finish within {}s", OCR_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("OCR failed: {e}"))
+}
+
+fn non_whitespace(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
 /// One paper [`PaperIndex::similar`] recommends.
@@ -718,7 +774,13 @@ pub(crate) mod tests {
         let report = index.build(&FakeEmbedder::new()).await.unwrap();
         assert_eq!(
             statuses(&report),
-            [("a2020", &PaperStatus::Indexed { chunks: 2 })]
+            [(
+                "a2020",
+                &PaperStatus::Indexed {
+                    chunks: 2,
+                    ocr: false
+                }
+            )]
         );
         let vectors = index.vectors("fake:model", "a2020").unwrap();
         assert!(!vectors.fallback);
@@ -944,12 +1006,22 @@ pub(crate) mod tests {
             papers: vec![
                 PaperReport {
                     citation_key: "a".to_string(),
-                    status: PaperStatus::Indexed { chunks: 3 },
+                    status: PaperStatus::Indexed {
+                        chunks: 3,
+                        ocr: false,
+                    },
                 },
                 PaperReport {
                     citation_key: "b".to_string(),
                     status: PaperStatus::Fallback {
                         reason: "no PDF".to_string(),
+                    },
+                },
+                PaperReport {
+                    citation_key: "c".to_string(),
+                    status: PaperStatus::Indexed {
+                        chunks: 5,
+                        ocr: true,
                     },
                 },
             ],
@@ -959,7 +1031,71 @@ pub(crate) mod tests {
             serde_json::json!({ "papers": [
                 { "citation_key": "a", "status": "indexed", "chunks": 3 },
                 { "citation_key": "b", "status": "fallback", "reason": "no PDF" },
+                { "citation_key": "c", "status": "indexed", "chunks": 5, "ocr": true },
             ]})
+        );
+    }
+
+    /// `bytes` written to a file in `scratch`, as a resolved PDF.
+    fn pdf_file(scratch: &Scratch, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = scratch.0.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_pdf_without_a_text_layer_is_read_by_ocr() {
+        use extract::tests::{image_only_pdf, ocr_available, pdftotext_available};
+        if !ocr_available() || !pdftotext_available() {
+            eprintln!("skipped: pdftotext, pdfinfo, pdftoppm or tesseract isn't available");
+            return;
+        }
+        let scratch = library("ocr", &[]);
+        let lines = [
+            "Introduction",
+            "This scanned paper has no text layer at all.",
+        ];
+        let scan = pdf_file(
+            &scratch,
+            "scan.pdf",
+            &image_only_pdf("index-ocr", &lines).unwrap(),
+        );
+        let (text, ocr) = pdf_text(scan).await.unwrap();
+        assert!(ocr);
+        assert!(text.contains("no text layer at all"), "{text}");
+
+        // A full text layer is used as it is.
+        let page = [
+            "A typed paper has a text layer long enough to stand for its page.",
+            "It runs past the hundred characters a page a scan has fewer of.",
+        ];
+        let typed = pdf_file(
+            &scratch,
+            "typed.pdf",
+            &extract::tests::pdf_with_lines(&page),
+        );
+        let (text, ocr) = pdf_text(typed).await.unwrap();
+        assert!(!ocr);
+        assert_eq!(text, page.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_blank_scan_falls_back_with_the_ocr_reason() {
+        use extract::tests::{image_only_pdf, ocr_available, pdftotext_available};
+        if !ocr_available() || !pdftotext_available() {
+            eprintln!("skipped: pdftotext, pdfinfo, pdftoppm or tesseract isn't available");
+            return;
+        }
+        let scratch = library("ocr-blank", &[]);
+        let blank = pdf_file(
+            &scratch,
+            "blank.pdf",
+            &image_only_pdf("index-ocr-blank", &[]).unwrap(),
+        );
+        let reason = pdf_text(blank).await.unwrap_err();
+        assert!(
+            reason.starts_with("the PDF has no text layer, and OCR failed"),
+            "{reason}"
         );
     }
 

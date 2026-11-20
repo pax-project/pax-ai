@@ -1086,8 +1086,10 @@ impl PaxServer {
     /// PDF fetched on this machine, embedded by a local Ollama server.
     /// Incremental: what's already indexed is reused, so a rerun only
     /// embeds new or changed papers, and entries for papers no longer in
-    /// the library are deleted. Reports one status per paper: `indexed`
-    /// with its chunk count, `fallback` with a reason when only the title
+    /// the library are deleted. A scanned PDF with no usable text layer
+    /// is read by OCR, which can take minutes per paper. Reports one
+    /// status per paper: `indexed` with its chunk count (and `ocr: true`
+    /// when this run read its text by OCR), `fallback` with a reason when only the title
     /// and venue are indexed (no PDF on this machine, or its text couldn't
     /// be extracted or embedded; `fetch` provides a missing PDF, then
     /// `index` again), or `failed` with a reason when nothing could be
@@ -4343,7 +4345,7 @@ mod tests {
 
         let Json(report) = server.index_with(&FakeEmbedder::new()).await.unwrap();
         assert!(
-            matches!(status(&report, "hewitt1973"), PaperStatus::Indexed { chunks } if chunks >= 1),
+            matches!(status(&report, "hewitt1973"), PaperStatus::Indexed { chunks, .. } if chunks >= 1),
             "{report:?}"
         );
         // turing1936's recorded hash isn't even a valid one, so nix can't
