@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Part of every full-text store key: bump it when a change here alters the
 /// text extracted from the same PDF, so old entries read as misses.
-pub const EXTRACTOR_VERSION: u32 = 1;
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// The extractor's binary, looked up on `PATH` (the flake's `pax-mcp` wraps
 /// poppler onto it).
@@ -37,6 +37,18 @@ const MIN_CHARS_PER_PAGE: usize = 100;
 /// A references heading before this fraction of the text is taken to be a
 /// table of contents entry or a cross-reference, not the section itself.
 const MIN_REFERENCES_POSITION: f64 = 0.3;
+
+/// How many non-empty lines after a references heading must be mostly
+/// reference entries for the heading to count.
+const CONFIRM_WINDOW: usize = 20;
+
+/// The lines a reference entry is taken to span: its first line and up to
+/// this many minus one lines it wraps onto.
+const MAX_ENTRY_LINES: usize = 4;
+
+/// The fewest entries a trailing reference list without a heading must have
+/// to be cut.
+const MIN_TRAILING_ENTRIES: usize = 10;
 
 /// Headings that start a references section, lowercased with spaces removed.
 const REFERENCES_HEADINGS: &[&str] = &[
@@ -296,29 +308,176 @@ fn clean(raw: &str) -> String {
     out
 }
 
-/// Cuts the text at its last references heading, if that heading is past
-/// `MIN_REFERENCES_POSITION` of the text. Anything after it (appendices
-/// included) goes too: telling an appendix from a long reference list isn't
-/// reliable from plain text.
+/// Cuts the text at its last confirmed references heading: one past
+/// `MIN_REFERENCES_POSITION` of the text whose next `CONFIRM_WINDOW`
+/// non-empty lines are mostly reference entries ([`mostly_entries`]). The
+/// heading and anything after it (appendices included) go: telling an
+/// appendix from a long reference list isn't reliable from plain text.
+///
+/// With no confirmed heading, a trailing list of at least
+/// `MIN_TRAILING_ENTRIES` entries is cut at its first entry: the earliest
+/// entry past `MIN_REFERENCES_POSITION` from which both the next
+/// `CONFIRM_WINDOW` non-empty lines and all the rest are mostly entries.
 fn strip_references(text: &str) -> &str {
-    let mut cut = None;
+    let mut lines = Vec::new();
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
-        if is_references_heading(line) {
-            cut = Some(offset);
+        if !line.trim().is_empty() {
+            lines.push((offset, line));
         }
         offset += line.len();
     }
-    match cut {
-        Some(at) if at as f64 >= text.len() as f64 * MIN_REFERENCES_POSITION => &text[..at],
-        _ => text,
+    let past_start = |at: usize| at as f64 >= text.len() as f64 * MIN_REFERENCES_POSITION;
+    let entries: Vec<bool> = lines
+        .iter()
+        .map(|(_, line)| is_reference_entry(line))
+        .collect();
+    let window = |from: usize| &entries[from..(from + CONFIRM_WINDOW).min(entries.len())];
+
+    let heading = (0..lines.len()).rev().find(|&i| {
+        let (at, line) = lines[i];
+        past_start(at) && is_references_heading(line) && mostly_entries(window(i + 1))
+    });
+    if let Some(i) = heading {
+        return &text[..lines[i].0];
     }
+
+    // Covered lines and entries from each line to the end. A suffix that
+    // starts at an entry covers the same lines alone as within the text.
+    let covered = coverage(&entries);
+    let mut covered_after = vec![0; lines.len() + 1];
+    let mut entries_after = vec![0; lines.len() + 1];
+    for i in (0..lines.len()).rev() {
+        covered_after[i] = covered_after[i + 1] + usize::from(covered[i]);
+        entries_after[i] = entries_after[i + 1] + usize::from(entries[i]);
+    }
+    let trailing = (0..lines.len()).find(|&i| {
+        entries[i]
+            && past_start(lines[i].0)
+            && entries_after[i] >= MIN_TRAILING_ENTRIES
+            && covered_after[i] * 2 > lines.len() - i
+            && mostly_entries(window(i))
+    });
+    match trailing {
+        Some(i) => &text[..lines[i].0],
+        None => text,
+    }
+}
+
+/// Whether more than half of these non-empty lines are part of a reference
+/// entry: its first line or one it wraps onto ([`coverage`]).
+fn mostly_entries(entries: &[bool]) -> bool {
+    let covered = coverage(entries).into_iter().filter(|&c| c).count();
+    covered * 2 > entries.len()
+}
+
+/// For each non-empty line, given which ones start a reference entry,
+/// whether it's part of one: an entry's first line or one of the
+/// `MAX_ENTRY_LINES - 1` lines after it.
+fn coverage(entries: &[bool]) -> Vec<bool> {
+    let mut since_entry: Option<usize> = None;
+    entries
+        .iter()
+        .map(|&entry| {
+            since_entry = if entry {
+                Some(0)
+            } else {
+                since_entry.map(|n| n + 1)
+            };
+            since_entry.is_some_and(|n| n < MAX_ENTRY_LINES)
+        })
+        .collect()
+}
+
+/// A line that starts a reference entry: a bracketed number or key (`[12]`,
+/// `[Bak77]`, `[AKW]`), a numbered entry (`12.`), or an author-year start
+/// (`Smith, J.`, `Smith, 1987`, `Smith (1987)`, `Smith 1987.`).
+fn is_reference_entry(line: &str) -> bool {
+    let line = line.trim_start();
+    let mut tokens = line.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let bracketed = line
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']').map(|end| &rest[..end]))
+        .is_some_and(|key| {
+            (1..=12).contains(&key.len())
+                && key
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "+-.".contains(c))
+        });
+    let numbered = first
+        .strip_suffix('.')
+        .is_some_and(|n| (1..=4).contains(&n.len()) && n.chars().all(|c| c.is_ascii_digit()));
+    let second = tokens.next();
+    bracketed || numbered || is_author_year(first, second, tokens.next().is_none())
+}
+
+/// `Surname, I.` or `Surname, 1987`; `Surname (1987)` or `Surname 1987.`;
+/// or a line of just `Surname 1987`. A bare year with more words after it
+/// (`In 1987 we`) isn't one.
+fn is_author_year(first: &str, second: Option<&str>, second_is_last: bool) -> bool {
+    let Some(second) = second else {
+        return false;
+    };
+    let (surname, comma) = match first.strip_suffix(',') {
+        Some(surname) => (surname, true),
+        None => (first, false),
+    };
+    let is_surname = surname.chars().count() >= 2
+        && surname.chars().next().is_some_and(char::is_uppercase)
+        && surname
+            .chars()
+            .all(|c| c.is_alphabetic() || "-'’".contains(c));
+    if !is_surname {
+        return false;
+    }
+    let year = second.trim_end_matches(['.', ',', ';', ':']);
+    if comma {
+        is_initials(second) || is_year(year.trim_start_matches('(').trim_end_matches(')'))
+    } else if let Some(inner) = year.strip_prefix('(') {
+        is_year(inner.trim_end_matches(')'))
+    } else {
+        is_year(year) && (second_is_last || second.ends_with('.'))
+    }
+}
+
+/// `J.`, `J.,`, `A.B.`, `J.-P.`: capital letters, each followed by a dot.
+fn is_initials(token: &str) -> bool {
+    let token = token.trim_end_matches([',', ';']);
+    let mut letters = 0;
+    let mut chars = token.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !c.is_uppercase() || chars.next() != Some('.') {
+            return false;
+        }
+        letters += 1;
+        if chars.peek() == Some(&'-') {
+            chars.next();
+        }
+    }
+    letters > 0
+}
+
+/// `1987`, `1987a`: four digits starting with 1 or 2, maybe a letter after.
+fn is_year(token: &str) -> bool {
+    let digits = token
+        .strip_suffix(|c: char| c.is_ascii_lowercase())
+        .unwrap_or(token);
+    digits.len() == 4
+        && digits.starts_with(['1', '2'])
+        && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// A line holding only a references heading, optionally numbered (`7`,
 /// `7.`, `VII.`) and letter-spaced the way small caps come out of
-/// `pdftotext` (`R EFERENCES`).
+/// `pdftotext` (`R EFERENCES`). A table of contents entry with dot leaders
+/// (`Bibliography ........`) isn't one.
 fn is_references_heading(line: &str) -> bool {
+    if line.contains("..") || line.contains(". .") || line.contains('…') {
+        return false;
+    }
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.len() > 1 && is_section_number(tokens[0]) {
         tokens.remove(0);
@@ -714,5 +873,132 @@ pub(crate) mod tests {
     fn keeps_text_without_a_references_heading() {
         let text = "Introduction\nbody\n";
         assert_eq!(strip_references(text), text);
+    }
+
+    /// A synthetic paper body: `paragraphs` lines of prose.
+    fn body(paragraphs: usize) -> String {
+        (0..paragraphs)
+            .map(|i| format!("Paragraph {i} argues that chunked embeddings beat a mean vector.\n"))
+            .collect()
+    }
+
+    #[test]
+    fn recognizes_reference_entries() {
+        for line in [
+            "[12] Author, A. A cited title. 2001.",
+            "[Bak77] Baker, B. Another title.",
+            "[AKW] Aho, Kernighan, Weinberger.",
+            "  [3] indented",
+            "12. Smith, J. A numbered entry.",
+            "12.",
+            "Smith, J. A cited title.",
+            "Smith, J.-P., and Doe, A.B. A title.",
+            "Smith, 1987. A title.",
+            "Smith, J. (1987) A title.",
+            "Smith (1987). A title.",
+            "Smith 1987. A title.",
+            "Smith 2020",
+            "O'Brien, K. A title.",
+        ] {
+            assert!(is_reference_entry(line), "{line:?}");
+        }
+        for line in [
+            "In 1987 the method was first described.",
+            "Moreover, the results hold.",
+            "However, Smith showed otherwise.",
+            "The references are listed below.",
+            "3.2 Results",
+            "[a long bracketed aside that isn't a key]",
+            "2020 was a busy year.",
+            "",
+        ] {
+            assert!(!is_reference_entry(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_dot_leader_contents_line_isnt_a_heading() {
+        for line in [
+            "Bibliography ........",
+            "Bibliography ........ 231",
+            "References . . . . . 12",
+            "References … 12",
+        ] {
+            assert!(!is_references_heading(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_spurious_heading_doesnt_win() {
+        let body = body(20);
+        let bibliography: String = (1..=12)
+            .map(|i| format!("[{i}] Author{i}, A. A cited title number {i}. 1990.\n"))
+            .collect();
+        let back_matter = "Bibliography\nThis report was typeset by its author.\n\
+                           Copies can be ordered from the department office.\n\
+                           Printed on recycled paper.\n";
+        let text = format!("{body}Bibliography\n{bibliography}{back_matter}");
+        assert_eq!(strip_references(&text), body);
+    }
+
+    #[test]
+    fn a_trailing_list_without_a_heading_is_cut_at_its_first_entry() {
+        let contents = "Contents\nIntroduction ........ 1\nBibliography ........\n";
+        let body = format!("{contents}{}", body(20));
+        // Entries in every shape, some wrapping onto a second or third line.
+        let mut bibliography = String::new();
+        for i in 1..=4 {
+            bibliography.push_str(&format!(
+                "[Key{i}] Author, A. A cited title\nthat wraps onto a second line.\n"
+            ));
+        }
+        for i in 5..=8 {
+            bibliography.push_str(&format!(
+                "Surname, B. ({}) A long cited title\nthat wraps onto a second line\nand a third.\n",
+                1980 + i
+            ));
+        }
+        for i in 9..=12 {
+            bibliography.push_str(&format!("{i}. Writer, C. A short cited title.\n"));
+        }
+        let text = format!("{body}{bibliography}");
+        assert_eq!(strip_references(&text), body);
+    }
+
+    #[test]
+    fn a_short_trailing_list_without_a_heading_stays() {
+        let entries: String = (1..MIN_TRAILING_ENTRIES)
+            .map(|i| format!("[{i}] Author, A. A cited title.\n"))
+            .collect();
+        let text = format!("{}{entries}", body(20));
+        assert_eq!(strip_references(&text), text);
+    }
+
+    #[test]
+    fn a_references_heading_and_list_near_the_start_stay() {
+        let text = format!(
+            "References\n[1] Author, A. A cited title.\n[2] Writer, B. Another.\n{}",
+            body(20)
+        );
+        assert_eq!(strip_references(&text), text);
+    }
+
+    #[test]
+    fn a_sentence_mentioning_references_stays() {
+        let text = format!(
+            "{}As the References section shows, few prior works chunk papers.\n\
+             References to earlier work appear throughout.\n{}",
+            body(10),
+            body(10)
+        );
+        assert_eq!(strip_references(&text), text);
+    }
+
+    #[test]
+    fn a_paper_without_references_is_unchanged() {
+        let steps = "1. Collect the papers.\n2. Extract their text.\n\
+                     3. Embed every chunk.\n4. Compare the chunk sets.\n";
+        let text = format!("{}{steps}Conclusion\n{}", body(10), body(5));
+        assert_eq!(strip_references(&text), text);
     }
 }
