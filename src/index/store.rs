@@ -15,11 +15,10 @@
 //! "model_id": "...", "artifact_hash": "...", "extractor_version": 1,
 //! "chunker_version": 1 }`. A title + venue key is `{ "kind": "title-venue",
 //! "model_id", "text_sha256" }`: the text itself never lands in the key. The
-//! file name's stem is the SHA-256 of that key JSON, the same in both
-//! formats. `get` checks the stored key, so a file whose key doesn't match
-//! reads as a miss.
+//! file name's stem is the SHA-256 of that key JSON. `get` checks the
+//! stored key, so a file whose key doesn't match reads as a miss.
 //!
-//! # On-disk format, version 2
+//! # On-disk format, version 3
 //!
 //! `<sha256 of the key>.bin`. Every integer is little-endian; `u32` lengths
 //! and counts, so no field exceeds 4 GiB:
@@ -27,7 +26,8 @@
 //! | bytes                | field                                        |
 //! |----------------------|----------------------------------------------|
 //! | 4                    | magic `PAXE`                                 |
-//! | 4                    | `u32` format version, `2`                    |
+//! | 4                    | `u32` format version, `3`                    |
+//! | 4                    | `u32` flags: bit 0 OCR, the others `0`       |
 //! | 4                    | `u32` key length `k`                         |
 //! | `k`                  | the key JSON (UTF-8)                         |
 //! | 4                    | `u32` chunk count `n`                        |
@@ -35,19 +35,18 @@
 //! | `n` × (4 + len)      | each chunk's `u32` text length, then its UTF-8 text, in order |
 //! | `n` × `d` × 4        | every vector's `d` `f32`s, chunk by chunk    |
 //!
-//! The vectors are raw `f32` bits, so they round-trip exactly and scores
-//! don't change. Every chunk of an entry has the same dimension; `put` skips
-//! (writes nothing for) an entry whose vectors differ in length. A file with
-//! another magic or version, one that ends early, one with bytes left over,
-//! or one whose text isn't UTF-8 reads as `None`.
+//! The OCR flag is [`Entry::ocr`]: set when a full-text entry's text was
+//! read by OCR, never on a title + venue entry. The vectors are raw `f32`
+//! bits, so they round-trip exactly and scores don't change. Every chunk of
+//! an entry has the same dimension; `put` skips (writes nothing for) an
+//! entry whose vectors differ in length. A file with another magic or
+//! version, an unknown flag bit, one that ends early, one with bytes left
+//! over, or one whose text isn't UTF-8 reads as `None`.
 //!
-//! # Version 1 (read only)
-//!
-//! `<sha256 of the key>.json`, written before version 2: `{ "format": 1,
-//! "key": { ... }, "chunks": [ { "text": "...", "vector": [0.1, ...] } ] }`.
-//! `get` falls back to it when no `.bin` exists, so an upgrade never forces a
-//! re-embed; `put` only writes version 2, and `prune` removes a `.json` once
-//! a `.bin` for the same key exists.
+//! Only version 3 is read. A file in an earlier format (a version 2 `.bin`,
+//! or a version 1 `<sha256 of the key>.json`) is a miss, so the next build
+//! embeds that paper again and overwrites the `.bin` in place; `prune`
+//! deletes every `.json`.
 //!
 //! [pruned]: EmbeddingStore::prune
 
@@ -58,20 +57,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The magic tag every version 2 entry starts with.
+/// The magic tag every entry starts with.
 const MAGIC: [u8; 4] = *b"PAXE";
 
-/// The version `put` writes. A `.bin` file carrying any other version reads
-/// as `None`.
-const FORMAT_VERSION: u32 = 2;
+/// The only version `put` writes and `get` reads.
+const FORMAT_VERSION: u32 = 3;
 
-/// The version of the legacy JSON entries, still read by `get`.
-const JSON_FORMAT_VERSION: u32 = 1;
+/// The flag bit set when an entry's text was read by OCR. Any other bit
+/// reads as `None`.
+const FLAG_OCR: u32 = 1;
 
-/// The extension of a version 2 entry.
+/// The extension of an entry.
 const BIN_EXT: &str = "bin";
 
-/// The extension of a version 1 entry.
+/// The extension of a version 1 file, which `prune` deletes.
 const JSON_EXT: &str = "json";
 
 /// What an entry's vectors were derived from, and so where it lives.
@@ -99,6 +98,9 @@ pub struct StoredChunk {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub chunks: Vec<StoredChunk>,
+    /// Whether a full-text entry's text was read by OCR (a scanned PDF);
+    /// always `false` for a title + venue entry.
+    pub ocr: bool,
 }
 
 /// The embedding store of one library.
@@ -115,20 +117,15 @@ impl EmbeddingStore {
         }
     }
 
-    /// The entry stored under `key`: the version 2 file, or else the version
-    /// 1 one. Missing, unreadable, malformed, in an unknown format, or stored
-    /// under a different key: `None`.
+    /// The entry stored under `key`. Missing, unreadable, malformed, in
+    /// another format version, or stored under a different key: `None`.
     pub fn get(&self, key: &EntryKey) -> Option<Entry> {
         let repr = KeyRepr::from(key);
-        let stem = repr.file_stem();
-        if let Ok(bytes) = std::fs::read(self.entry_path(&stem, BIN_EXT)) {
-            return decode(&bytes, &repr);
-        }
-        let bytes = std::fs::read(self.entry_path(&stem, JSON_EXT)).ok()?;
-        decode_json(&bytes, &repr)
+        let bytes = std::fs::read(self.entry_path(&repr.file_stem(), BIN_EXT)).ok()?;
+        decode(&bytes, &repr)
     }
 
-    /// Stores `entry` under `key` in version 2, replacing any previous one.
+    /// Stores `entry` under `key` in version 3, replacing any previous one.
     ///
     /// Written to a sibling temp file and renamed into place, as in
     /// `SummaryCache::write_entry`, so a concurrent reader never sees a
@@ -158,8 +155,8 @@ impl EmbeddingStore {
         }
     }
 
-    /// Deletes entries whose key isn't in `keep`, and version 1 files whose
-    /// key also has a version 2 file; returns how many files it deleted.
+    /// Deletes entries whose key isn't in `keep`, and every version 1
+    /// `.json` file; returns how many files it deleted.
     ///
     /// Only entry files (`<sha256>.bin` and `<sha256>.json`) are considered,
     /// so anything else in the directory, an in-flight temp file included, is
@@ -180,7 +177,7 @@ impl EmbeddingStore {
                 }
                 let doomed = match ext {
                     BIN_EXT => !keep.contains(stem),
-                    JSON_EXT => !keep.contains(stem) || self.entry_path(stem, BIN_EXT).exists(),
+                    JSON_EXT => true,
                     _ => false,
                 };
                 doomed && std::fs::remove_file(e.path()).is_ok()
@@ -260,7 +257,7 @@ impl KeyRepr {
     }
 }
 
-/// `entry` under `key` in version 2; `None` when its vectors differ in
+/// `entry` under `key` in version 3; `None` when its vectors differ in
 /// length or a field doesn't fit a `u32`.
 fn encode(key: &KeyRepr, entry: &Entry) -> Option<Vec<u8>> {
     let dim = entry.chunks.first().map_or(0, |c| c.vector.len());
@@ -269,9 +266,11 @@ fn encode(key: &KeyRepr, entry: &Entry) -> Option<Vec<u8>> {
     }
     let key_json = key.json();
     let texts: usize = entry.chunks.iter().map(|c| 4 + c.text.len()).sum();
-    let mut out = Vec::with_capacity(4 * 5 + key_json.len() + texts + entry.chunks.len() * dim * 4);
+    let mut out = Vec::with_capacity(4 * 6 + key_json.len() + texts + entry.chunks.len() * dim * 4);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    let flags = if entry.ocr { FLAG_OCR } else { 0 };
+    out.extend_from_slice(&flags.to_le_bytes());
     put_bytes(&mut out, &key_json)?;
     put_u32(&mut out, entry.chunks.len())?;
     put_u32(&mut out, dim)?;
@@ -295,10 +294,14 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// A version 2 file's entry, if it is well formed and stored under `key`.
+/// A version 3 file's entry, if it is well formed and stored under `key`.
 fn decode(bytes: &[u8], key: &KeyRepr) -> Option<Entry> {
     let mut r = Reader(bytes);
     if r.take(4)? != MAGIC || r.u32()? != FORMAT_VERSION {
+        return None;
+    }
+    let flags = r.u32()?;
+    if flags & !FLAG_OCR != 0 {
         return None;
     }
     let key_len = r.len()?;
@@ -336,10 +339,13 @@ fn decode(bytes: &[u8], key: &KeyRepr) -> Option<Entry> {
                 .collect(),
         })
         .collect();
-    Some(Entry { chunks })
+    Some(Entry {
+        chunks,
+        ocr: flags & FLAG_OCR != 0,
+    })
 }
 
-/// A cursor over a version 2 file; every read past the end is `None`.
+/// A cursor over an entry file; every read past the end is `None`.
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -359,37 +365,6 @@ impl<'a> Reader<'a> {
     fn len(&mut self) -> Option<usize> {
         usize::try_from(self.u32()?).ok()
     }
-}
-
-/// A version 1 file's entry, if it parses and is stored under `key`.
-fn decode_json(bytes: &[u8], key: &KeyRepr) -> Option<Entry> {
-    let file: JsonEntryFile = serde_json::from_slice(bytes).ok()?;
-    if file.format != JSON_FORMAT_VERSION || file.key != *key {
-        return None;
-    }
-    Some(Entry {
-        chunks: file
-            .chunks
-            .into_iter()
-            .map(|c| StoredChunk {
-                text: c.text,
-                vector: c.vector,
-            })
-            .collect(),
-    })
-}
-
-#[derive(Deserialize)]
-struct JsonEntryFile {
-    format: u32,
-    key: KeyRepr,
-    chunks: Vec<JsonChunk>,
-}
-
-#[derive(Deserialize)]
-struct JsonChunk {
-    text: String,
-    vector: Vec<f32>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -462,6 +437,7 @@ mod tests {
                     vector: vec![0.6, -0.8, i as f32 * 0.1, 1.0e-7, f32::MIN_POSITIVE],
                 })
                 .collect(),
+            ocr: false,
         }
     }
 
@@ -483,11 +459,12 @@ mod tests {
                         .collect(),
                 })
                 .collect(),
+            ocr: false,
         }
     }
 
     /// Writes `entry` under `key` as a version 1 `.json` file, as the store
-    /// did before version 2.
+    /// did before version 2, and returns its path.
     fn put_v1(scratch: &Scratch, key: &EntryKey, entry: &Entry) -> PathBuf {
         let repr = KeyRepr::from(key);
         let chunks: Vec<_> = entry
@@ -510,6 +487,16 @@ mod tests {
             .join(format!("{}.bin", KeyRepr::from(key).file_stem()))
     }
 
+    /// Writes `entry` under `key` as a version 2 `.bin` file, as the store
+    /// did before version 3: version 3's layout without the flags.
+    fn put_v2(scratch: &Scratch, key: &EntryKey, entry: &Entry) {
+        let mut bytes = encode(&KeyRepr::from(key), entry).unwrap();
+        bytes.drain(8..12);
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::create_dir_all(scratch.embeddings_dir()).unwrap();
+        std::fs::write(bin_path(scratch, key), bytes).unwrap();
+    }
+
     #[test]
     fn a_put_entry_reads_back_exactly_from_a_new_store() {
         let scratch = Scratch::new("roundtrip");
@@ -521,7 +508,7 @@ mod tests {
         assert_eq!(
             scratch.entry_files(),
             vec![bin_path(&scratch, &key)],
-            "put writes only a version 2 file"
+            "put writes only a version 3 file"
         );
         assert_eq!(
             EmbeddingStore::for_library(&scratch.0).get(&key),
@@ -530,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_round_trip_is_bit_exact() {
+    fn a_version_3_round_trip_is_bit_exact() {
         let scratch = Scratch::new("bit-exact");
         let store = EmbeddingStore::for_library(&scratch.0);
         let key = full_text("sha256-abc");
@@ -561,8 +548,12 @@ mod tests {
         let scratch = Scratch::new("empty");
         let store = EmbeddingStore::for_library(&scratch.0);
         let key = title_venue("A Title. Venue");
-        store.put(&key, &Entry { chunks: vec![] });
-        assert_eq!(store.get(&key), Some(Entry { chunks: vec![] }));
+        let empty = Entry {
+            chunks: vec![],
+            ocr: false,
+        };
+        store.put(&key, &empty);
+        assert_eq!(store.get(&key), Some(empty));
     }
 
     #[test]
@@ -579,72 +570,62 @@ mod tests {
         assert!(scratch.entry_files().is_empty());
     }
 
-    /// Prints the on-disk size of one 768-dimension chunk in both versions;
-    /// `cargo test smaller -- --nocapture` shows it.
     #[test]
-    fn version_2_is_much_smaller_than_version_1() {
-        let scratch = Scratch::new("sizes");
-        let key = full_text("sha256-abc");
-        let stored = realistic_entry(1);
-        let v1 = put_v1(&scratch, &key, &stored);
-        EmbeddingStore::for_library(&scratch.0).put(&key, &stored);
+    fn the_ocr_flag_round_trips() {
+        let scratch = Scratch::new("ocr-flag");
+        let store = EmbeddingStore::for_library(&scratch.0);
+        let scanned = full_text("sha256-scanned");
+        let typed = full_text("sha256-typed");
+        let ocr = Entry {
+            ocr: true,
+            ..entry(&["scanned"])
+        };
+        store.put(&scanned, &ocr);
+        store.put(&typed, &entry(&["typed"]));
 
-        let v1_len = std::fs::metadata(v1).unwrap().len();
-        let v2_len = std::fs::metadata(bin_path(&scratch, &key)).unwrap().len();
-        let text_len = stored.chunks[0].text.len();
-        println!(
-            "one 768-dim chunk, {text_len} B of text: v1 {v1_len} B, v2 {v2_len} B ({:.2}x smaller)",
-            v1_len as f64 / v2_len as f64
-        );
-        assert!(v2_len < v1_len / 2, "v1 {v1_len} B, v2 {v2_len} B");
+        let store = EmbeddingStore::for_library(&scratch.0);
+        assert_eq!(store.get(&scanned), Some(ocr));
+        assert_eq!(store.get(&typed), Some(entry(&["typed"])));
+        let flags = |key: &EntryKey| {
+            let bytes = std::fs::read(bin_path(&scratch, key)).unwrap();
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        };
+        assert_eq!(flags(&scanned), 1);
+        assert_eq!(flags(&typed), 0);
     }
 
     #[test]
-    fn a_version_1_entry_is_still_read() {
-        let scratch = Scratch::new("v1");
+    fn an_unknown_flag_bit_reads_as_none() {
+        let scratch = Scratch::new("flags");
         let store = EmbeddingStore::for_library(&scratch.0);
-        let full = full_text("sha256-abc");
-        let title = title_venue("A Title. Venue");
-        put_v1(&scratch, &full, &entry(&["full", "text"]));
-        put_v1(&scratch, &title, &entry(&["title"]));
+        let key = full_text("sha256-abc");
+        store.put(&key, &entry(&["chunk"]));
+        let path = bin_path(&scratch, &key);
+        let good = std::fs::read(&path).unwrap();
 
-        assert_eq!(store.get(&full), Some(entry(&["full", "text"])));
-        assert_eq!(store.get(&title), Some(entry(&["title"])));
+        for flags in [2u32, 3, 1 << 31, u32::MAX] {
+            let mut bad = good.clone();
+            bad[8..12].copy_from_slice(&flags.to_le_bytes());
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(store.get(&key), None, "flags {flags:#x}");
+        }
     }
 
     #[test]
-    fn a_version_2_entry_wins_over_a_version_1_one() {
-        let scratch = Scratch::new("v2-wins");
+    fn earlier_formats_read_as_none() {
+        let scratch = Scratch::new("earlier");
         let store = EmbeddingStore::for_library(&scratch.0);
-        let key = full_text("sha256-abc");
-        put_v1(&scratch, &key, &entry(&["old"]));
-        store.put(&key, &entry(&["new"]));
+        let v2 = full_text("sha256-v2");
+        let v1 = title_venue("A Title. Venue");
+        put_v2(&scratch, &v2, &entry(&["v2"]));
+        put_v1(&scratch, &v1, &entry(&["v1"]));
 
-        assert_eq!(store.get(&key), Some(entry(&["new"])));
-    }
+        assert_eq!(store.get(&v2), None);
+        assert_eq!(store.get(&v1), None);
 
-    #[test]
-    fn a_mismatched_malformed_or_unknown_version_1_file_reads_as_none() {
-        let scratch = Scratch::new("v1-bad");
-        let store = EmbeddingStore::for_library(&scratch.0);
-        let key = full_text("sha256-abc");
-        let other = full_text("sha256-other");
-        let path = put_v1(&scratch, &key, &entry(&["chunk"]));
-        let other_path = put_v1(&scratch, &other, &entry(&["other"]));
-
-        // A file under `key`'s name that holds another key's entry.
-        std::fs::copy(&other_path, &path).unwrap();
-        assert_eq!(store.get(&key), None);
-
-        put_v1(&scratch, &key, &entry(&["chunk"]));
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let bumped = contents.replacen("\"format\":1", "\"format\":3", 1);
-        assert_ne!(contents, bumped);
-        std::fs::write(&path, bumped).unwrap();
-        assert_eq!(store.get(&key), None);
-
-        std::fs::write(&path, b"{\"format\":1,").unwrap();
-        assert_eq!(store.get(&key), None);
+        // The next build's `put` overwrites the version 2 file in place.
+        store.put(&v2, &entry(&["v3"]));
+        assert_eq!(store.get(&v2), Some(entry(&["v3"])));
     }
 
     #[test]
@@ -728,7 +709,10 @@ mod tests {
         let store = EmbeddingStore::for_library(&scratch.0);
         store.put(
             &title_venue("A Distinctive Title"),
-            &Entry { chunks: vec![] },
+            &Entry {
+                chunks: vec![],
+                ocr: false,
+            },
         );
 
         let files = scratch.entry_files();
@@ -757,10 +741,10 @@ mod tests {
         let good = std::fs::read(&path).unwrap();
 
         let mut version = good.clone();
-        version[4..8].copy_from_slice(&3u32.to_le_bytes());
+        version[4..8].copy_from_slice(&4u32.to_le_bytes());
         let mut magic = good.clone();
         magic[0] = b'X';
-        for (what, bad) in [("version 3", version), ("another magic", magic)] {
+        for (what, bad) in [("version 4", version), ("another magic", magic)] {
             std::fs::write(&path, bad).unwrap();
             assert_eq!(store.get(&key), None, "{what}");
         }
@@ -793,8 +777,8 @@ mod tests {
         store.put(&key, &entry(&["chunk"]));
         let path = bin_path(&scratch, &key);
         let good = std::fs::read(&path).unwrap();
-        let key_len = u32::from_le_bytes(good[8..12].try_into().unwrap()) as usize;
-        let counts = 12 + key_len;
+        let key_len = u32::from_le_bytes(good[12..16].try_into().unwrap()) as usize;
+        let counts = 16 + key_len;
         let text = counts + 8 + 4;
 
         let set_u32 = |at: usize, n: u32| {
@@ -803,11 +787,11 @@ mod tests {
             bytes
         };
         let mut bad_key_json = good.clone();
-        bad_key_json[12] = b'[';
+        bad_key_json[16] = b'[';
         let mut bad_utf8 = good.clone();
         bad_utf8[text] = 0xff;
         for (what, bad) in [
-            ("key length past the end", set_u32(8, u32::MAX)),
+            ("key length past the end", set_u32(12, u32::MAX)),
             ("key not JSON", bad_key_json),
             ("chunk count past the end", set_u32(counts, u32::MAX)),
             ("dimension past the end", set_u32(counts + 4, u32::MAX)),
@@ -860,38 +844,28 @@ mod tests {
     }
 
     #[test]
-    fn prune_handles_both_versions() {
-        let scratch = Scratch::new("prune-versions");
+    fn prune_deletes_every_version_1_file() {
+        let scratch = Scratch::new("prune-json");
         let store = EmbeddingStore::for_library(&scratch.0);
-        // Kept, with only a v1 file: it stays, since `get` still reads it.
-        let v1_only = full_text("v1-only");
-        // Kept, with both: the v1 file is superseded.
-        let upgraded = full_text("upgraded");
-        // Not kept: every file goes, whichever version.
-        let dropped_v1 = full_text("dropped-v1");
-        let dropped_both = title_venue("Dropped. Venue");
-
-        let v1_only_path = put_v1(&scratch, &v1_only, &entry(&["v1"]));
-        let upgraded_v1 = put_v1(&scratch, &upgraded, &entry(&["old"]));
-        store.put(&upgraded, &entry(&["new"]));
-        put_v1(&scratch, &dropped_v1, &entry(&["gone"]));
-        put_v1(&scratch, &dropped_both, &entry(&["gone"]));
-        store.put(&dropped_both, &entry(&["gone"]));
-        let tmp = scratch.embeddings_dir().join(format!(
-            "{}.tmp.1.2",
-            KeyRepr::from(&dropped_v1).file_stem()
-        ));
+        // Kept or not, a `.json` is never an entry any more.
+        let kept = full_text("kept");
+        let dropped = title_venue("Dropped. Venue");
+        let kept_json = put_v1(&scratch, &kept, &entry(&["old"]));
+        let dropped_json = put_v1(&scratch, &dropped, &entry(&["gone"]));
+        store.put(&kept, &entry(&["new"]));
+        let tmp = scratch
+            .embeddings_dir()
+            .join(format!("{}.tmp.1.2", KeyRepr::from(&dropped).file_stem()));
         std::fs::write(&tmp, b"in flight").unwrap();
 
-        let keep: HashSet<EntryKey> = [v1_only.clone(), upgraded.clone()].into();
-        assert_eq!(store.prune(&keep), 4);
+        let keep: HashSet<EntryKey> = [kept.clone()].into();
+        assert_eq!(store.prune(&keep), 2);
 
-        let mut expected = vec![v1_only_path, bin_path(&scratch, &upgraded), tmp];
+        let mut expected = vec![bin_path(&scratch, &kept), tmp];
         expected.sort();
         assert_eq!(scratch.entry_files(), expected);
-        assert!(!upgraded_v1.exists());
-        assert_eq!(store.get(&v1_only), Some(entry(&["v1"])));
-        assert_eq!(store.get(&upgraded), Some(entry(&["new"])));
+        assert!(!kept_json.exists() && !dropped_json.exists());
+        assert_eq!(store.get(&kept), Some(entry(&["new"])));
         assert_eq!(store.prune(&keep), 0);
     }
 

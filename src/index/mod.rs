@@ -67,8 +67,8 @@ pub struct PaperReport {
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum PaperStatus {
     /// Its title + venue vector and `chunks` full-text chunks are stored.
-    /// `ocr` is set when this build read the text by OCR (a scanned PDF);
-    /// a full-text entry reused from an earlier build doesn't record it.
+    /// `ocr` is set when the text was read by OCR (a scanned PDF), by this
+    /// build or by the one that stored a reused full-text entry.
     Indexed {
         chunks: usize,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -188,7 +188,9 @@ impl PaperIndex {
     ) -> PaperStatus {
         if self.store.get(&keys.title_venue).is_none() {
             match embed_documents(embedder, &[keys.title_venue_text.as_str()]).await {
-                Ok(chunks) => self.store.put(&keys.title_venue, &Entry { chunks }),
+                Ok(chunks) => self
+                    .store
+                    .put(&keys.title_venue, &Entry { chunks, ocr: false }),
                 Err(e) => {
                     return PaperStatus::Failed {
                         reason: format!("embedding the title and venue failed: {e}"),
@@ -205,7 +207,7 @@ impl PaperIndex {
         if let Some(entry) = self.store.get(full_text_key) {
             return PaperStatus::Indexed {
                 chunks: entry.chunks.len(),
-                ocr: false,
+                ocr: entry.ocr,
             };
         }
         let (chunks, ocr) = match self.full_text_chunks(&paper.local.citation_key).await {
@@ -225,7 +227,13 @@ impl PaperIndex {
             }
         }
         let count = stored.len();
-        self.store.put(full_text_key, &Entry { chunks: stored });
+        self.store.put(
+            full_text_key,
+            &Entry {
+                chunks: stored,
+                ocr,
+            },
+        );
         PaperStatus::Indexed { chunks: count, ocr }
     }
 
@@ -768,6 +776,7 @@ pub(crate) mod tests {
             &full_text,
             &Entry {
                 chunks: vec![chunk("one", vec![1.0, 0.0]), chunk("two", vec![0.0, 1.0])],
+                ocr: false,
             },
         );
 
@@ -786,6 +795,57 @@ pub(crate) mod tests {
         assert!(!vectors.fallback);
         let texts: Vec<&str> = vectors.chunks.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, ["Attention", "one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_reused_ocr_entry_still_reports_ocr() {
+        // An entry an earlier build stored from a scanned PDF: reusing it
+        // calls neither OCR, `nix`, nor the embedder.
+        let scratch = library("reuse-ocr", &[]);
+        let with_hash = paper("a2020", "Attention", None, None)
+            .replace("hash = null", "hash = \"sha256-AAAA\"");
+        write_papers(&scratch.0, &[with_hash]);
+        let index = PaperIndex::open(&scratch.0);
+        let vector = |text: &str| StoredChunk {
+            text: text.to_string(),
+            vector: vec![1.0, 0.0],
+        };
+        index.store.put(
+            &EntryKey::TitleVenue {
+                model_id: "fake:model".to_string(),
+                text: "Attention".to_string(),
+            },
+            &Entry {
+                chunks: vec![vector("Attention")],
+                ocr: false,
+            },
+        );
+        index.store.put(
+            &EntryKey::FullText {
+                model_id: "fake:model".to_string(),
+                artifact_hash: "sha256-AAAA".to_string(),
+                extractor_version: extract::EXTRACTOR_VERSION,
+                chunker_version: chunk::CHUNKER_VERSION,
+            },
+            &Entry {
+                chunks: vec![vector("scanned text")],
+                ocr: true,
+            },
+        );
+
+        let embedder = FakeEmbedder::new();
+        let report = index.build(&embedder).await.unwrap();
+        assert_eq!(
+            statuses(&report),
+            [(
+                "a2020",
+                &PaperStatus::Indexed {
+                    chunks: 1,
+                    ocr: true
+                }
+            )]
+        );
+        assert_eq!(embedder.embedded(), 0, "the embedder was called");
     }
 
     #[tokio::test]
@@ -887,6 +947,7 @@ pub(crate) mod tests {
                     vector,
                 })
                 .collect(),
+            ocr: false,
         };
         let key = EntryKey::TitleVenue {
             model_id: "fake:model".to_string(),
@@ -1172,6 +1233,7 @@ pub(crate) mod tests {
             },
             &Entry {
                 chunks: vec![chunk("Attention", fake_vector("Attention").await)],
+                ocr: false,
             },
         );
         index.store.put(
@@ -1189,6 +1251,7 @@ pub(crate) mod tests {
                         fake_vector("self-attention layers").await,
                     ),
                 ],
+                ocr: false,
             },
         );
 
