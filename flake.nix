@@ -42,9 +42,15 @@
         PARAMETER num_ctx 8192
       '';
 
-      # Runtime tools `pax-mcp` shells out to: poppler's `pdftotext` extracts
-      # a paper's full text for the embedding index (src/index/extract.rs).
-      runtime_deps = [ pkgs.poppler-utils ];
+      # Runtime tools `pax-mcp` shells out to for the embedding index
+      # (src/index/extract.rs): poppler's `pdftotext` extracts a paper's full
+      # text; for a scanned PDF, `pdfinfo` counts its pages, `pdftoppm`
+      # renders them and `tesseract` reads them. Only tesseract's English
+      # data is bundled (the default build ships every language, ~1 GB).
+      runtime_deps = [
+        pkgs.poppler-utils
+        (pkgs.tesseract.override { enableLanguages = [ "eng" ]; })
+      ];
 
       # `nix run` and `lib.getExe` find the `pax-mcp` binary through
       # mainProgram; the package is named after the crate (pax-ai). The
