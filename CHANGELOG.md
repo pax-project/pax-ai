@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/pax-project/pax-ai/compare/v0.1.0...v0.2.0) - 2026-11-22
+
+### Features
+
+- *(mcp)* let search name its providers, dblp included ([#82](https://github.com/pax-project/pax-ai/pull/82))
+
+### Fixed
+
+- *(deps)* update url to 2.5.9 for RUSTSEC-2026-0592 ([#81](https://github.com/pax-project/pax-ai/pull/81))
+
 ## [0.1.0](https://github.com/pax-project/pax-ai/releases/tag/v0.1.0) - 2026-11-22
 
 ### Features
