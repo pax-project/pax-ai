@@ -120,12 +120,31 @@ impl PagingParams {
     }
 }
 
+/// `search`'s `providers`, parsed as the CLI's `--provider` is; none means
+/// pax-core's default set.
+fn providers(names: &[String]) -> Result<Vec<ProviderId>, String> {
+    names
+        .iter()
+        .map(|name| {
+            name.trim().parse().map_err(|e| {
+                format!("{e}; `providers` takes openalex, crossref, semanticscholar, arxiv or dblp")
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// Free-text query. Give exactly one of `query` or `author`.
     pub query: Option<String>,
     /// Author name, for an author-scoped search instead of free text.
     pub author: Option<String>,
+    /// Ask only these providers: `openalex`, `crossref`, `semanticscholar`,
+    /// `arxiv` or `dblp`. Without it, every provider but dblp is asked;
+    /// dblp (computer science only) is asked only when named, alone or
+    /// beside others.
+    #[serde(default)]
+    pub providers: Vec<String>,
     /// Rank the returned results by how close in content each is to this
     /// library paper (a citation key or alias, which must be in the
     /// embedding index): see `ranking` in the result. Turns
@@ -567,7 +586,8 @@ impl PaxServer {
         }
     }
 
-    /// Search every provider (OpenAlex, Crossref, Semantic Scholar, arXiv) for
+    /// Search the providers (OpenAlex, Crossref, Semantic Scholar, arXiv, or
+    /// those named in `providers`, which can add dblp) for
     /// papers, by free text or by author, optionally filtered by year, type,
     /// and language. Reports each provider's retrieved/total counts, then one
     /// list merged across providers, each paper flagged if it's already in
@@ -1425,6 +1445,7 @@ impl PaxServer {
         params: SearchParams,
     ) -> Result<Json<RankedOutput<SearchResults>>, String> {
         let options = params.paging.options()?;
+        let options = options.with_providers(providers(&params.providers)?);
         let (root, config) = (&self.root, &self.config);
         let (query, by_author) = match (params.query, params.author) {
             (Some(query), None) => (query, false),
@@ -2210,6 +2231,38 @@ mod tests {
         ] {
             assert!(server.search(Parameters(params)).await.is_err());
         }
+    }
+
+    #[test]
+    fn search_providers_parse_as_the_clis_and_refuse_unknown_names() {
+        assert_eq!(providers(&[]), Ok(vec![]));
+        assert_eq!(
+            providers(&["dblp".to_string(), " openalex ".to_string()]),
+            Ok(vec![ProviderId::Dblp, ProviderId::OpenAlex])
+        );
+        let error = providers(&["scholar".to_string()]).unwrap_err();
+        assert!(
+            error.contains("scholar") && error.contains("dblp"),
+            "{error}"
+        );
+        let options =
+            SearchOptions::default().with_providers(providers(&["dblp".to_string()]).unwrap());
+        assert_eq!(options.search_providers(), vec![ProviderId::Dblp]);
+    }
+
+    #[tokio::test]
+    async fn search_refuses_an_unknown_provider_before_searching() {
+        let server = PaxServer::new(PathBuf::from("."), Config::default());
+        let error = server
+            .search(Parameters(SearchParams {
+                query: Some("actor model".to_string()),
+                providers: vec!["scholar".to_string()],
+                ..SearchParams::default()
+            }))
+            .await
+            .err()
+            .expect("the search should be refused");
+        assert!(error.contains("unknown provider"), "{error}");
     }
 
     #[tokio::test]
