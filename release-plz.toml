@@ -1,0 +1,22 @@
+[workspace]
+# Same convention as pax-core: `feature(scope):` for minor bumps. `fix`,
+# `!`, and a `BREAKING CHANGE:` footer already match the Conventional
+# Commits defaults release-plz expects.
+custom_minor_increment_regex = "^feature"
+# Not on crates.io: consumers take the flake at a `v*` tag (e.g.
+# `github:pax-project/pax-ai/v0.1.0`). So the last release is read from
+# the latest v* git tag rather than the registry, which is also what lets
+# release-plz tag and cut a GitHub release for a publish = false package.
+publish = false
+git_only = true
+
+[changelog]
+commit_parsers = [
+  { message = "^feature", group = "Features" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^.*", skip = true },
+]
+
+[[package]]
+name = "pax-ai"
+changelog_path = "./CHANGELOG.md"

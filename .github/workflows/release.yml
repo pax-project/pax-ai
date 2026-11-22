@@ -1,0 +1,18 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# No binary attach (unlike pax-core and lazy-pax): the flake's pax-mcp is
+# wrapped with its runtime tools' store paths, so a tarball of it wouldn't
+# run off this machine's Nix store. Consumers use the flake at a tag.
+jobs:
+  release:
+    permissions:
+      contents: write
+      pull-requests: read
+    uses: pax-project/.github/.github/workflows/rust-release-publish.yml@main
+    secrets:
+      # Unused (publish = false), but the reusable workflow requires it.
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
