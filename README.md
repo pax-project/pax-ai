@@ -42,6 +42,8 @@ cargo build --release --bin pax-mcp
 claude mcp add pax -- /path/to/pax-mcp /path/to/library
 ```
 
+Or take it from the flake at a release tag (`github:pax-project/pax-ai/v0.1.0`), whose `pax-mcp` package has poppler and tesseract wrapped in; releases are git tags and GitHub releases only, not crates.io.
+
 `SEMANTIC_SCHOLAR_API_KEY` and `ARXIV_CONTACT` are read from the environment, as for `pax`. The embedding tools need a local [Ollama](https://ollama.com) server on `localhost:11434` with the `nomic-embed-text` model: `ollama pull nomic-embed-text`, or, without the network, `ollama create nomic-embed-text -f <path>/Modelfile` from this flake's `nomic-embed-text-model` package. Indexing also needs poppler and tesseract on `PATH`, which the flake's `pax-mcp` package already wraps in. The index lives in the library at `research/.pax-ai/`, which keeps itself out of git: a cache derived from `papers.nix` and the PDFs, safe to delete and rebuild with `index`.
 
 Library consumers that don't need the server can depend on `pax-ai` with `default-features = false` to leave out the `mcp` feature and its dependencies.
